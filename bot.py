@@ -34,6 +34,7 @@ import json
 import certifi
 import os
 import threading
+import threading
 
 app = Flask(__name__)
 
@@ -46,6 +47,16 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 threading.Thread(target=run_web).start()
+
+
+def bot_loop():
+    while True:
+        print("BOT IS RUNNING")
+        # your get_orders() logic here
+        time.sleep(10)
+
+# start bot thread
+threading.Thread(target=bot_loop, daemon=True).start()
 # =========================================================
 # SSL FIX (IMPORTANT FOR RENDER/macOS)
 # =========================================================
