@@ -57,6 +57,25 @@ def bot_loop():
 
 # start bot thread
 threading.Thread(target=bot_loop, daemon=True).start()
+
+print("STARTING MAIN BOT LOOP")
+
+while True:
+
+    print("BOT LOOP ACTIVE")
+
+    try:
+
+        orders = get_orders()
+
+        print("FOUND ORDERS:", len(orders))
+
+        time.sleep(15)
+
+    except Exception as e:
+
+        print("MAIN LOOP ERROR:", e)
+        
 # =========================================================
 # SSL FIX (IMPORTANT FOR RENDER/macOS)
 # =========================================================
