@@ -310,27 +310,6 @@ def mark_as_paid(order_id):
 
         return False
 
-# ========================================
-#loop
-# ========================================
-print("STARTING MAIN BOT LOOP")
-
-while True:
-
-    print("BOT LOOP ACTIVE")
-
-    try:
-
-        orders = get_orders()
-
-        print("FOUND ORDERS:", len(orders))
-
-        time.sleep(15)
-
-    except Exception as e:
-
-        print("MAIN LOOP ERROR:", e)
-
 # =========================================================
 # EXTRACT ORDER DETAILS
 # =========================================================
@@ -546,3 +525,26 @@ while True:
         print("MAIN LOOP ERROR:", main_error)
 
         time.sleep(10)
+
+# ========================================
+#loop
+# ========================================
+print("STARTING MAIN BOT LOOP")
+
+while True:
+
+    print("BOT LOOP ACTIVE")
+
+    try:
+
+        orders = get_orders()
+
+        print("FOUND ORDERS:", len(orders))
+
+        time.sleep(15)
+
+    except Exception as e:
+
+        print("MAIN LOOP ERROR:", e)
+
+
