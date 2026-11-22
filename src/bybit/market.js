@@ -8,27 +8,40 @@ const config = require('../config');
 let loggedKeys = false;
 
 const RATE_LIMIT_CODE = 10006;
+const MAX_ATTEMPTS = 4;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The SDK may throw OR return the rate-limit error, so handle both.
+async function callWithRetry(fn) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fn();
+      const code = res.ret_code ?? res.retCode;
+      if (code === RATE_LIMIT_CODE && attempt < MAX_ATTEMPTS) {
+        console.log(`[market] rate limited, retry ${attempt}/${MAX_ATTEMPTS - 1} in ${3 * attempt}s`);
+        await sleep(3000 * attempt);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      const limited = String(err.message || '').includes(String(RATE_LIMIT_CODE));
+      if (!limited || attempt === MAX_ATTEMPTS) throw err;
+      console.log(`[market] rate limited (thrown), retry ${attempt}/${MAX_ATTEMPTS - 1} in ${3 * attempt}s`);
+      await sleep(3000 * attempt);
+    }
+  }
+}
 
 async function fetchLiveSellAds() {
-  let response;
-
-  // Retry a few times if Bybit says "too many visits"
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    response = await client.getOnlineAds({
+  const response = await callWithRetry(() =>
+    client.getOnlineAds({
       tokenId: config.market.coin,
       currencyId: config.market.fiat,
       side: '1', // 1 = sell ads
       size: config.market.fetchCount,
-    });
-
-    const code = response.ret_code ?? response.retCode;
-    if (code === RATE_LIMIT_CODE && attempt < 3) {
-      console.log(`[market] rate limited, retry ${attempt}/2 in ${2 * attempt}s`);
-      await new Promise((r) => setTimeout(r, 2000 * attempt));
-      continue;
-    }
-    break;
-  }
+    })
+  );
 
   // Surface API-level errors instead of silently returning nothing
   const code = response.ret_code ?? response.retCode;

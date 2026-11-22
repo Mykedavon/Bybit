@@ -3,6 +3,7 @@
 
 require('dotenv').config();
 
+const http = require('http');
 const config = require('./config');
 const telegram = require('./telegram/bot');
 const inventory = require('./managers/inventory');
@@ -10,6 +11,34 @@ const sellManager = require('./managers/sellManager');
 const decision = require('./managers/decision');
 const executor = require('./managers/executor');
 const buyerMessaging = require('./managers/buyerMessaging');
+
+// ── Health server (lets Render see an open port) ──────────
+function startHealthServer() {
+  const port = process.env.PORT || 10000;
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+  });
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`[health] listening on ${port}`);
+  });
+  return server;
+}
+
+// Pings our own public URL so the free plan does not put us to sleep.
+// RENDER_EXTERNAL_URL is set automatically by Render.
+function startKeepAwake() {
+  const url = process.env.RENDER_EXTERNAL_URL;
+  if (!url) return;
+  setInterval(async () => {
+    try {
+      await fetch(url);
+    } catch (err) {
+      console.log('[keepawake] ping failed:', err.message);
+    }
+  }, 10 * 60 * 1000);
+  console.log('[keepawake] self-ping every 10 min');
+}
 
 // ── Failure tracking ──────────────────────────────────────
 let consecutiveFailures = 0;
@@ -123,8 +152,10 @@ async function runCycle() {
 }
 
 // ── Buyer order monitoring ────────────────────────────────
+// Disabled unless BUYER_MESSAGING=on (Bybit closed the old chat API).
 async function monitorBuyerOrders() {
   if (telegram.isManual()) return;
+  if (process.env.BUYER_MESSAGING !== 'on') return;
 
   try {
     const raw = await require('./bybit/client').client.getMyOrders({
@@ -205,6 +236,10 @@ async function main() {
       : '[startup] MODE: LIVE — ads WILL be edited'
   );
 
+  // 0. Open the port first so Render marks the deploy healthy quickly
+  const healthServer = startHealthServer();
+  startKeepAwake();
+
   // 1. Run first cycle FIRST — before Telegram
   await runCycleSafe();
 
@@ -225,6 +260,7 @@ async function main() {
     console.log(`[shutdown] received ${sig}`);
     if (cycleTimer) clearInterval(cycleTimer);
     try { telegram.stop(); } catch (_) {}
+    try { healthServer.close(); } catch (_) {}
     setTimeout(() => process.exit(0), 500);
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
