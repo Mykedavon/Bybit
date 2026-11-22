@@ -51,7 +51,16 @@ async function runCycle() {
   try {
     sellCycleResult = await sellManager.runSellCycle();
     if (!sellCycleResult.ok) {
-      recordFailure('sellManager', sellCycleResult.reason || 'unknown');
+      const soft = ['no_genuine_competitor', 'no_ads_returned'];
+      if (soft.includes(sellCycleResult.reason)) {
+        // Nothing to price against — not an error, just skip this cycle
+        console.log(`[cycle] skipped: ${sellCycleResult.reason}`);
+      } else {
+        recordFailure(
+          'sellManager',
+          `${sellCycleResult.reason || 'unknown'}${sellCycleResult.error ? ' (' + sellCycleResult.error + ')' : ''}`
+        );
+      }
       return;
     }
   } catch (err) {
@@ -67,11 +76,8 @@ async function runCycle() {
     return;
   }
 
-  const ad1State = await decision.getAdState(config.ads.sellAd1Id);
-  const ad2State = await decision.getAdState(config.ads.sellAd2Id);
-
-  const ad1Exec = await executor.applyDecision(evalResult.ad1, ad1State);
-  const ad2Exec = await executor.applyDecision(evalResult.ad2, ad2State);
+  const ad1Exec = await executor.applyDecision(evalResult.ad1, evalResult.ad1State);
+  const ad2Exec = await executor.applyDecision(evalResult.ad2, evalResult.ad2State);
 
   if (evalResult.ad1.action === 'BLOCK' && evalResult.ad1.reason === 'below_profit_floor') {
     await telegram.sendProfitFloorWarning(
@@ -141,13 +147,22 @@ async function monitorBuyerOrders() {
 
 // ── Cycle loop ────────────────────────────────────────────
 let cycleTimer = null;
+let cycleRunning = false;
 
 async function runCycleSafe() {
+  // Never let two cycles overlap (slow network would otherwise stack them)
+  if (cycleRunning) {
+    console.log('[cycle] previous cycle still running — skipped');
+    return;
+  }
+  cycleRunning = true;
   try {
     await runCycle();
     await monitorBuyerOrders();
   } catch (err) {
     console.error('[cycle] uncaught:', err.message);
+  } finally {
+    cycleRunning = false;
   }
 }
 
@@ -172,7 +187,7 @@ async function maybeSendDailyReport() {
 }
 
 // ── Telegram launch with timeout (never blocks bot) ───────
-function launchTelegramWithTimeout(ms = 10000) {
+function launchTelegramWithTimeout(ms = 15000) {
   return Promise.race([
     telegram.launch(),
     new Promise((_, reject) =>
@@ -184,12 +199,17 @@ function launchTelegramWithTimeout(ms = 10000) {
 // ── Startup ───────────────────────────────────────────────
 async function main() {
   console.log('[startup] loading config…');
+  console.log(
+    config.dryRun
+      ? '[startup] MODE: DRY_RUN — no ads will be edited'
+      : '[startup] MODE: LIVE — ads WILL be edited'
+  );
 
   // 1. Run first cycle FIRST — before Telegram
   await runCycleSafe();
 
   // 2. Telegram in background with timeout — never blocks trading
-  launchTelegramWithTimeout(10000)
+  launchTelegramWithTimeout(15000)
     .then(() => console.log('[startup] telegram launched'))
     .catch((err) => console.error('[startup] telegram failed:', err.message));
 

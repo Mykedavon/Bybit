@@ -28,13 +28,7 @@ async function getAdState(adId) {
 }
 
 // ── Decide for one ad ─────────────────────────────────────
-// Inputs:
-//   adState: current ad from Bybit
-//   target: { targetPrice, reason }
-//   spendable: available USDC balance
-//   floor: profit floor price
-// Output:
-//   { action: 'EDIT'|'SKIP'|'BLOCK', ... }
+// Output: { action: 'EDIT'|'SKIP'|'BLOCK', ... }
 function decideForAd(adState, target, spendable, floor) {
   const result = {
     adId: adState.id,
@@ -47,8 +41,20 @@ function decideForAd(adState, target, spendable, floor) {
     return { ...result, action: 'SKIP', reason: target.reason };
   }
 
+  // No profit floor available → never edit (fail closed)
+  if (floor === null || floor === undefined) {
+    return {
+      ...result,
+      action: 'BLOCK',
+      reason: 'no_profit_floor',
+      targetPrice: target.targetPrice,
+      floor: null,
+      shortfall: null,
+    };
+  }
+
   // ── Check profit floor ────────────────────────────────
-  if (floor !== null && target.targetPrice < floor) {
+  if (target.targetPrice < floor) {
     return {
       ...result,
       action: 'BLOCK',
@@ -85,21 +91,27 @@ function decideForAd(adState, target, spendable, floor) {
 }
 
 // ── Main: evaluate both ads ──────────────────────────────
-// Inputs:
-//   sellCycleResult: output of sellManager.runSellCycle()
-//   spendable: available USDC
-// Output:
-//   { ad1: decision, ad2: decision, floor, weightedAvg }
+// Output: { ad1, ad2, ad1State, ad2State, floor, weightedAvg }
 async function evaluateBothAds(sellCycleResult, spendable) {
   // Get profit floor
   const buys = await fetchCompletedBuys();
   const weightedAvg = weightedAvgBuyPrice(buys);
-  const floor = profitFloor(weightedAvg);
+  let floor = profitFloor(weightedAvg);
+  floor = Number.isFinite(floor) ? floor : null;
 
-  console.log(`[decision] weighted avg buy: ${weightedAvg ? weightedAvg.toFixed(2) : 'N/A'}`);
-  console.log(`[decision] profit floor: ${floor ? floor.toFixed(2) : 'N/A'}`);
+  // Optional manual floor when there is no buy history yet
+  if (floor === null && config.profit.manualFloor > 0) {
+    floor = config.profit.manualFloor;
+    console.log(`[decision] using MANUAL_PROFIT_FLOOR: ${floor}`);
+  }
 
-  // Read both ads
+  console.log(`[decision] weighted avg buy: ${weightedAvg ? Number(weightedAvg).toFixed(2) : 'N/A'}`);
+  console.log(`[decision] profit floor: ${floor !== null ? floor.toFixed(2) : 'N/A'}`);
+  if (floor === null) {
+    console.log('[decision] WARNING: no profit floor available — all edits are blocked');
+  }
+
+  // Read both ads once per cycle
   const ad1State = await getAdState(config.ads.sellAd1Id);
   const ad2State = await getAdState(config.ads.sellAd2Id);
 
@@ -110,6 +122,8 @@ async function evaluateBothAds(sellCycleResult, spendable) {
   return {
     ad1: ad1Decision,
     ad2: ad2Decision,
+    ad1State,
+    ad2State,
     floor,
     weightedAvg,
   };

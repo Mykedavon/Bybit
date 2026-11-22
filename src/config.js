@@ -62,7 +62,17 @@ module.exports = {
   profit: {
     weightedAvgBuyCount: num('WEIGHTED_AVG_BUY_COUNT', 12),
     minProfitPerUsdc: num('MIN_PROFIT_PER_USDC', 10),
+    // Used only when no buy history exists. 0 = disabled (edits stay blocked).
+    manualFloor: num('MANUAL_PROFIT_FLOOR', 0),
   },
+
+  safety: {
+    // An edit that moves an ad's price by more than this % is refused.
+    maxPriceMovePct: num('MAX_PRICE_MOVE_PCT', 5),
+  },
+
+  // Safe by default: ads are only edited when DRY_RUN is exactly "false".
+  dryRun: str('DRY_RUN', 'true').trim().toLowerCase() !== 'false',
 
   timing: {
     cycleSeconds: num('CYCLE_SECONDS', 60),
