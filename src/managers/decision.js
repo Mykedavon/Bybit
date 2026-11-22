@@ -6,9 +6,32 @@ const { client } = require('../bybit/client');
 const { fetchCompletedBuys, weightedAvgBuyPrice, profitFloor } = require('../bybit/orders');
 const config = require('../config');
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Retry when Bybit answers "too many visits" (ErrCode 10006)
+async function withRetry(label, fn, attempts = 4) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fn();
+      const code = res && (res.ret_code ?? res.retCode);
+      if (code === 10006 && i < attempts) {
+        console.log(`[decision] ${label} rate limited, retry ${i}/${attempts - 1} in ${3 * i}s`);
+        await sleep(3000 * i);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      const limited = String(err.message || '').includes('10006');
+      if (!limited || i === attempts) throw err;
+      console.log(`[decision] ${label} rate limited (thrown), retry ${i}/${attempts - 1} in ${3 * i}s`);
+      await sleep(3000 * i);
+    }
+  }
+}
+
 // ── Read current ad state ─────────────────────────────────
 async function getAdState(adId) {
-  const response = await client.getAdInfo(adId);
+  const response = await withRetry(`getAdInfo ${adId}`, () => client.getAdInfo(adId));
   const data = response.result || response;
 
   return {
@@ -25,6 +48,33 @@ async function getAdState(adId) {
     payments: data.payments,
     paymentPeriod: data.paymentPeriod,
   };
+}
+
+// ── Profit floor (cached) ─────────────────────────────────
+// Completed buys change rarely, so fetch at most every 5 minutes.
+// If a fetch fails, reuse the last known floor for up to 30 minutes.
+const FLOOR_TTL_MS = 5 * 60 * 1000;
+const FLOOR_STALE_MAX_MS = 30 * 60 * 1000;
+let floorCache = { at: 0, floor: null, weightedAvg: null };
+
+async function getProfitFloor() {
+  const age = Date.now() - floorCache.at;
+  if (floorCache.at && age < FLOOR_TTL_MS) return floorCache;
+
+  try {
+    const buys = await withRetry('completed buys', () => fetchCompletedBuys());
+    const weightedAvg = weightedAvgBuyPrice(buys);
+    let floor = profitFloor(weightedAvg);
+    floor = Number.isFinite(floor) ? floor : null;
+    floorCache = { at: Date.now(), floor, weightedAvg };
+    return floorCache;
+  } catch (err) {
+    if (floorCache.at && age < FLOOR_STALE_MAX_MS) {
+      console.log(`[decision] buys fetch failed (${err.message}) — reusing floor from ${Math.round(age / 1000)}s ago`);
+      return floorCache;
+    }
+    throw err;
+  }
 }
 
 // ── Decide for one ad ─────────────────────────────────────
@@ -93,11 +143,9 @@ function decideForAd(adState, target, spendable, floor) {
 // ── Main: evaluate both ads ──────────────────────────────
 // Output: { ad1, ad2, ad1State, ad2State, floor, weightedAvg }
 async function evaluateBothAds(sellCycleResult, spendable) {
-  // Get profit floor
-  const buys = await fetchCompletedBuys();
-  const weightedAvg = weightedAvgBuyPrice(buys);
-  let floor = profitFloor(weightedAvg);
-  floor = Number.isFinite(floor) ? floor : null;
+  const cached = await getProfitFloor();
+  const weightedAvg = cached.weightedAvg;
+  let floor = cached.floor;
 
   // Optional manual floor when there is no buy history yet
   if (floor === null && config.profit.manualFloor > 0) {
