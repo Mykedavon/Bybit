@@ -7,13 +7,28 @@ const config = require('../config');
 
 let loggedKeys = false;
 
+const RATE_LIMIT_CODE = 10006;
+
 async function fetchLiveSellAds() {
-  const response = await client.getOnlineAds({
-    tokenId: config.market.coin,
-    currencyId: config.market.fiat,
-    side: '1', // 1 = sell ads
-    size: config.market.fetchCount,
-  });
+  let response;
+
+  // Retry a few times if Bybit says "too many visits"
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    response = await client.getOnlineAds({
+      tokenId: config.market.coin,
+      currencyId: config.market.fiat,
+      side: '1', // 1 = sell ads
+      size: config.market.fetchCount,
+    });
+
+    const code = response.ret_code ?? response.retCode;
+    if (code === RATE_LIMIT_CODE && attempt < 3) {
+      console.log(`[market] rate limited, retry ${attempt}/2 in ${2 * attempt}s`);
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
+      continue;
+    }
+    break;
+  }
 
   // Surface API-level errors instead of silently returning nothing
   const code = response.ret_code ?? response.retCode;
@@ -25,7 +40,7 @@ async function fetchLiveSellAds() {
   const result = response.result || response;
   const items = result.items || [];
 
-  // One-time log so we can verify the real field names on Bybit's side
+  // One-time log so the real field names can be verified
   if (!loggedKeys && items[0]) {
     console.log('[market] sample ad keys:', Object.keys(items[0]).join(','));
     loggedKeys = true;

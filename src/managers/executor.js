@@ -1,6 +1,7 @@
 // src/managers/executor.js
 // Takes decisions from decision.js and applies them to Bybit.
 // Read-modify-write with verify-after-write.
+// DRY_RUN=true (default): logs what would be sent, never edits an ad.
 
 const { client } = require('../bybit/client');
 const { getAdState } = require('./decision');
@@ -42,6 +43,18 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
     };
   }
 
+  // Sanity guard: refuse large single-step price moves
+  if (priceChanged && adState.price > 0) {
+    const movePct = (Math.abs(newPrice - adState.price) / adState.price) * 100;
+    if (movePct > config.safety.maxPriceMovePct) {
+      console.error(
+        `[executor] REFUSED ad ${adId}: price ${adState.price} -> ${newPrice} ` +
+        `is a ${movePct.toFixed(2)}% move (limit ${config.safety.maxPriceMovePct}%)`
+      );
+      return { ok: false, adId, reason: 'price_move_too_large' };
+    }
+  }
+
   // Build full parameter set (Bybit requires all fields on update)
   const params = {
     id: adId,
@@ -58,10 +71,28 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
     paymentPeriod: String(adState.paymentPeriod || '15'),
   };
 
+  // Dry run: show exactly what would be sent, then stop
+  if (config.dryRun) {
+    console.log(
+      `[executor] DRY_RUN — would update ad ${adId}: ` +
+      `price ${adState.price} -> ${params.price}, ` +
+      `quantity ${adState.quantity} -> ${params.quantity}`
+    );
+    console.log('[executor] DRY_RUN params:', JSON.stringify(params));
+    return { ok: true, adId, action: 'dry_run', newPrice, newQuantity };
+  }
+
   try {
-    await client.updateAd(params);
+    const res = await client.updateAd(params);
+    const code = res && (res.ret_code ?? res.retCode);
+    if (code !== undefined && code !== 0) {
+      const msg = res.ret_msg ?? res.retMsg ?? '';
+      console.error(`[executor] updateAd rejected for ad ${adId}: ${code} ${msg}`);
+      return { ok: false, adId, reason: 'update_failed', error: `${code} ${msg}` };
+    }
     recordEdit(adId);
   } catch (err) {
+    console.error(`[executor] updateAd failed for ad ${adId}:`, err.message);
     return { ok: false, adId, reason: 'update_failed', error: err.message };
   }
 
