@@ -26,7 +26,6 @@ function startHealthServer() {
 }
 
 // Pings our own public URL so the free plan does not put us to sleep.
-// RENDER_EXTERNAL_URL is set automatically by Render.
 function startKeepAwake() {
   const url = process.env.RENDER_EXTERNAL_URL;
   if (!url) return;
@@ -82,7 +81,6 @@ async function runCycle() {
     if (!sellCycleResult.ok) {
       const soft = ['no_genuine_competitor', 'no_ads_returned'];
       if (soft.includes(sellCycleResult.reason)) {
-        // Nothing to price against — not an error, just skip this cycle
         console.log(`[cycle] skipped: ${sellCycleResult.reason}`);
       } else {
         recordFailure(
@@ -151,11 +149,20 @@ async function runCycle() {
   }
 }
 
-// ── Buyer order monitoring ────────────────────────────────
-// Disabled unless BUYER_MESSAGING=on (Bybit closed the old chat API).
-async function monitorBuyerOrders() {
-  if (telegram.isManual()) return;
-  if (process.env.BUYER_MESSAGING !== 'on') return;
+// ── Order polling (own timer, separate from repricing) ────
+const ORDER_POLL_SECONDS = Number(process.env.ORDER_POLL_SECONDS) || 10;
+let orderPollRunning = false;
+let ordersSeeded = false;
+const seenOrders = new Set();
+
+// New orders are logged only (no Telegram message)
+async function announceOrder(order) {
+  console.log(`[orders] new order ${order.id}`);
+}
+
+async function pollOrders() {
+  if (orderPollRunning) return;
+  orderPollRunning = true;
 
   try {
     const raw = await require('./bybit/client').client.getMyOrders({
@@ -164,24 +171,54 @@ async function monitorBuyerOrders() {
       page: '1',
       size: '20',
     });
-    const result = raw.result || raw;
-    const orders = result.items || [];
+    const code = raw.ret_code ?? raw.retCode;
+    if (code !== undefined && code !== 0) {
+      throw new Error(`getMyOrders failed: ${code} ${raw.ret_msg ?? raw.retMsg ?? ''}`);
+    }
+    const orders = (raw.result || raw).items || [];
+
+    // First poll after startup: note existing orders in the log
+    if (!ordersSeeded) {
+      orders.forEach((o) => seenOrders.add(String(o.id)));
+      ordersSeeded = true;
+      console.log(`[orders] first poll: ${orders.length} open order(s) already pending`);
+    }
+
+    const msgMode = buyerMessaging.mode();
 
     for (const order of orders) {
-      await buyerMessaging.sendInitialMessages(order);
-      await buyerMessaging.checkBuyerReply(order);
+      const id = String(order.id);
+
+      if (!seenOrders.has(id)) {
+        seenOrders.add(id);
+        await announceOrder(order);
+      }
+
+      // Auto-messages pause in Manual mode
+      if (msgMode !== 'off' && !telegram.isManual()) {
+        const r = await buyerMessaging.sendInitialMessages(order);
+        if (r.reason === 'gave_up' && r.error) {
+          await telegram.send(
+            config.telegram.chatId,
+            `⚠️ Could not message the buyer on order ${id}: ${r.error}\nHandle the chat manually on Bybit.`
+          );
+        }
+        await buyerMessaging.checkBuyerReply(order);
+      }
     }
   } catch (err) {
-    console.log('[buyerMonitor] error:', err.message);
+    console.log('[orders] poll error:', err.message);
+  } finally {
+    orderPollRunning = false;
   }
 }
 
 // ── Cycle loop ────────────────────────────────────────────
 let cycleTimer = null;
+let orderTimer = null;
 let cycleRunning = false;
 
 async function runCycleSafe() {
-  // Never let two cycles overlap (slow network would otherwise stack them)
   if (cycleRunning) {
     console.log('[cycle] previous cycle still running — skipped');
     return;
@@ -189,7 +226,6 @@ async function runCycleSafe() {
   cycleRunning = true;
   try {
     await runCycle();
-    await monitorBuyerOrders();
   } catch (err) {
     console.error('[cycle] uncaught:', err.message);
   } finally {
@@ -235,6 +271,7 @@ async function main() {
       ? '[startup] MODE: DRY_RUN — no ads will be edited'
       : '[startup] MODE: LIVE — ads WILL be edited'
   );
+  console.log(`[startup] BUYER_MESSAGING: ${buyerMessaging.mode()}`);
 
   // 0. Open the port first so Render marks the deploy healthy quickly
   const healthServer = startHealthServer();
@@ -252,13 +289,19 @@ async function main() {
   cycleTimer = setInterval(runCycleSafe, config.timing.cycleSeconds * 1000);
   console.log(`[startup] cycle running every ${config.timing.cycleSeconds}s`);
 
-  // 4. Daily report check every 30s
+  // 4. Order polling on its own, faster timer
+  pollOrders();
+  orderTimer = setInterval(pollOrders, ORDER_POLL_SECONDS * 1000);
+  console.log(`[startup] order polling every ${ORDER_POLL_SECONDS}s`);
+
+  // 5. Daily report check every 30s
   setInterval(maybeSendDailyReport, 30 * 1000);
 
-  // 5. Graceful shutdown
+  // 6. Graceful shutdown
   const shutdown = (sig) => {
     console.log(`[shutdown] received ${sig}`);
     if (cycleTimer) clearInterval(cycleTimer);
+    if (orderTimer) clearInterval(orderTimer);
     try { telegram.stop(); } catch (_) {}
     try { healthServer.close(); } catch (_) {}
     setTimeout(() => process.exit(0), 500);

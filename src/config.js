@@ -71,8 +71,8 @@ module.exports = {
     maxPriceMovePct: num('MAX_PRICE_MOVE_PCT', 5),
   },
 
-  // Safe by default: ads are only edited when DRY_RUN is exactly "false".
-  dryRun: str('DRY_RUN', 'true').trim().toLowerCase() !== 'false',
+  // LIVE by default. Dry run only happens when DRY_RUN is exactly "true".
+  dryRun: str('DRY_RUN', 'false').trim().toLowerCase() === 'true',
 
   timing: {
     cycleSeconds: num('CYCLE_SECONDS', 60),
