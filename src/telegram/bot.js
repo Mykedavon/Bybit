@@ -5,7 +5,11 @@
 const { Telegraf, Markup } = require('telegraf');
 const config = require('../config');
 
-const bot = new Telegraf(config.telegram.botToken);
+const bot = new Telegraf(config.telegram.botToken || 'MISSING_TOKEN');
+
+bot.catch((err) => {
+  console.error('[telegram] handler error:', err.message);
+});
 
 // ── Bot mode state ────────────────────────────────────────
 // 'auto' or 'manual'. Resets to 'auto' on restart (per spec).
@@ -28,10 +32,20 @@ function scheduleDelete(chatId, messageId, ms) {
   timers.set(key, t);
 }
 
+// Never throws: a Telegram problem must not stop the selling cycle.
 async function send(chatId, text, options = {}, deleteAfterMs = 0) {
-  const msg = await bot.telegram.sendMessage(chatId, text, options);
-  if (deleteAfterMs > 0) scheduleDelete(chatId, msg.message_id, deleteAfterMs);
-  return msg;
+  try {
+    if (!chatId) {
+      console.error('[telegram] send skipped: TELEGRAM_CHAT_ID is empty');
+      return null;
+    }
+    const msg = await bot.telegram.sendMessage(chatId, text, options);
+    if (deleteAfterMs > 0) scheduleDelete(chatId, msg.message_id, deleteAfterMs);
+    return msg;
+  } catch (err) {
+    console.error('[telegram] send failed:', err.message);
+    return null;
+  }
 }
 
 // ── Mode button panel ─────────────────────────────────────
@@ -61,7 +75,9 @@ async function refreshPanel() {
       buildPanel().reply_markup
     );
   } catch (_) {
-    await sendPanel();
+    try { await sendPanel(); } catch (err) {
+      console.error('[telegram] panel refresh failed:', err.message);
+    }
   }
 }
 
@@ -77,25 +93,17 @@ bot.action('toggle_mode', async (ctx) => {
 let lastProfitFloorMsgId = null;
 
 async function sendProfitFloorWarning(adLabel, targetPrice, floor, shortfall) {
-  // Delete previous warning first
-  if (lastProfitFloorMsgId) {
-    try {
-      await bot.telegram.deleteMessage(config.telegram.chatId, lastProfitFloorMsgId);
-    } catch (_) {}
-    lastProfitFloorMsgId = null;
-  }
+  await clearProfitFloorWarning();
 
   const text =
-    `⚠️ *Profit Floor Block* — ${adLabel}\n` +
+    `⚠️ Profit Floor Block - ${adLabel}\n` +
     `Target: ₦${targetPrice}\n` +
     `Floor: ₦${floor}\n` +
     `Shortfall: ₦${shortfall}\n` +
     `Ad NOT edited.`;
 
-  const msg = await bot.telegram.sendMessage(config.telegram.chatId, text, {
-    parse_mode: 'Markdown',
-  });
-  lastProfitFloorMsgId = msg.message_id;
+  const msg = await send(config.telegram.chatId, text);
+  if (msg) lastProfitFloorMsgId = msg.message_id;
 }
 
 async function clearProfitFloorWarning() {
@@ -109,51 +117,66 @@ async function clearProfitFloorWarning() {
 
 // ── Failure alert ─────────────────────────────────────────
 async function sendFailureAlert(lines) {
-  const text = `🔴 *Bot Failure Alert*\n\n${lines.join('\n')}`;
+  const text = `🔴 Bot Failure Alert\n\n${lines.join('\n')}`;
   const ms = config.failures.retentionHours * 60 * 60 * 1000;
-  await send(config.telegram.chatId, text, { parse_mode: 'Markdown' }, ms);
+  await send(config.telegram.chatId, text, {}, ms);
 }
 
 // ── Cancellation blame alert ──────────────────────────────
 async function sendCancellationAlert(orderId, reason) {
   const text =
-    `🚫 *Cancellation Blame Detected*\n\n` +
-    `Order: \`${orderId}\`\n` +
+    `🚫 Cancellation Blame Detected\n\n` +
+    `Order: ${orderId}\n` +
     `Reason: ${reason}\n\n` +
     `API cannot auto-reject for sellers. Handle manually on Bybit.`;
   const fiveHours = 5 * 60 * 60 * 1000;
-  await send(config.telegram.chatId, text, { parse_mode: 'Markdown' }, fiveHours);
+  await send(config.telegram.chatId, text, {}, fiveHours);
 }
 
 // ── Daily report ──────────────────────────────────────────
 async function sendDailyReport(stats) {
   const text =
-    `📊 *Daily Report* — ${stats.date}\n\n` +
+    `📊 Daily Report - ${stats.date}\n\n` +
     `Trades: ${stats.totalTrades}\n` +
     `USDC bought: ${stats.totalBought}\n` +
     `USDC sold: ${stats.totalSold}\n` +
     `Avg buy: ₦${stats.avgBuy}\n` +
     `Avg sell: ₦${stats.avgSell}\n` +
     `Profit: ₦${stats.profit}`;
-  return send(config.telegram.chatId, text, { parse_mode: 'Markdown' });
+  return send(config.telegram.chatId, text);
 }
 
 // ── Monthly report ────────────────────────────────────────
 async function sendMonthlyReport(stats) {
   const text =
-    `📊 *Monthly Report* — ${stats.month}\n\n` +
+    `📊 Monthly Report - ${stats.month}\n\n` +
     `Trades: ${stats.totalTrades}\n` +
     `USDC bought: ${stats.totalBought}\n` +
     `USDC sold: ${stats.totalSold}\n` +
     `Avg buy: ₦${stats.avgBuy}\n` +
     `Avg sell: ₦${stats.avgSell}\n` +
     `Profit: ₦${stats.profit}`;
-  return send(config.telegram.chatId, text, { parse_mode: 'Markdown' });
+  return send(config.telegram.chatId, text);
 }
 
 // ── Launch ────────────────────────────────────────────────
+// bot.launch() only resolves when the bot stops, so it must NOT be awaited.
 async function launch() {
-  await bot.launch();
+  if (!config.telegram.botToken) {
+    throw new Error('TELEGRAM_BOT_TOKEN is empty');
+  }
+  if (!config.telegram.chatId) {
+    throw new Error('TELEGRAM_CHAT_ID is empty');
+  }
+
+  // Fails fast with a clear message if the token is wrong
+  const me = await bot.telegram.getMe();
+  console.log(`[telegram] token ok, bot @${me.username}`);
+
+  bot.launch({ dropPendingUpdates: true }).catch((err) => {
+    console.error('[telegram] polling stopped:', err.message);
+  });
+
   await sendPanel();
   console.log('[telegram] launched, panel sent');
 }
