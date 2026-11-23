@@ -92,11 +92,10 @@ async function getProfitFloor() {
   }
 }
 
-// ── Keep the two ads' prices apart ────────────────────────
+// ── Keep the two ads' prices apart (Ad 2 always >= Ad 1) ──
 // Bybit rejects two of your own ads at (nearly) the same price (ErrCode 90043)
-// and does not say how far apart they must be. Ad 2 starts a small gap below
-// ad 1; each time Bybit rejects the gap, the executor calls noteCollision()
-// and the next cycle uses a wider one. AD_PRICE_SEPARATION_NGN sets the start.
+// and does not say how far apart they must be. Ad 2 stays at least `sep` above
+// ad 1 so ad 2 is never cheaper than ad 1.
 const SEPARATION_STEPS = [0.25, 0.5, 1, 1.5, 2, 3];
 
 function initialStep() {
@@ -115,25 +114,27 @@ function separationNgn() {
 function noteCollision() {
   if (separationStep < SEPARATION_STEPS.length - 1) {
     separationStep += 1;
-    console.log(`[decision] Bybit rejected the price gap — ad 2 will now sit ₦${separationNgn()} below ad 1`);
+    console.log(`[decision] Bybit rejected the price gap — ad 2 will now sit ₦${separationNgn()} above ad 1`);
   } else {
     console.log('[decision] Bybit rejected the price gap again at the widest setting — check the ads manually');
   }
 }
 
-// If ad 2's target is within the separation of ad 1's, ad 2 goes below ad 1.
+// Ad 2 must never be cheaper than ad 1: if ad 2's target is below ad 1's
+// (or closer than `sep` above ad 1's), lift ad 2 to `ad1.targetPrice + sep`.
 function separateTargets(t1, t2) {
   if (!t1 || !t2) return t2;
   if (t1.targetPrice === null || t1.targetPrice === undefined) return t2;
   if (t2.targetPrice === null || t2.targetPrice === undefined) return t2;
 
   const sep = separationNgn();
-  if (Math.abs(t1.targetPrice - t2.targetPrice) < sep - 1e-9) {
-    const adjusted = Number((t1.targetPrice - sep).toFixed(2));
+  const minAd2Price = Number((t1.targetPrice + sep).toFixed(2));
+
+  if (t2.targetPrice < minAd2Price - 1e-9) {
     console.log(
-      `[decision] ad 2 target ${t2.targetPrice} is too close to ad 1 (${t1.targetPrice}) — using ${adjusted}`
+      `[decision] ad 2 target ${t2.targetPrice} is below/too close to ad 1 (${t1.targetPrice}) — using ${minAd2Price}`
     );
-    return { ...t2, targetPrice: adjusted };
+    return { ...t2, targetPrice: minAd2Price };
   }
   return t2;
 }
