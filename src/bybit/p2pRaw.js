@@ -7,7 +7,7 @@ const config = require('../config');
 
 const BASE_URL = process.env.BYBIT_P2P_BASE_URL || 'https://api.bybit.com';
 const RECV_WINDOW = '5000';
-const MIN_GAP_MS = Number(process.env.BYBIT_P2P_MIN_GAP_MS || 600);
+const MIN_GAP_MS = Number(process.env.BYBIT_P2P_MIN_GAP_MS || 650);
 const MAX_RATE_RETRIES = 3;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

@@ -3,6 +3,7 @@
 // the rest of the bot relies on. No filtering. No decisions.
 
 const { client } = require('./client');
+const { scheduleP2P } = require('./p2pRaw');
 const config = require('../config');
 
 let loggedKeys = false;
@@ -12,23 +13,29 @@ const MAX_ATTEMPTS = 4;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function runP2P(fn) {
+  return typeof scheduleP2P === 'function' ? scheduleP2P(fn) : fn();
+}
+
 // The SDK may throw OR return the rate-limit error, so handle both.
 async function callWithRetry(fn) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const res = await fn();
-      const code = res.ret_code ?? res.retCode;
+      const res = await runP2P(fn);
+      const code = res && (res.ret_code ?? res.retCode);
       if (code === RATE_LIMIT_CODE && attempt < MAX_ATTEMPTS) {
-        console.log(`[market] rate limited, retry ${attempt}/${MAX_ATTEMPTS - 1} in ${3 * attempt}s`);
-        await sleep(3000 * attempt);
+        const delayMs = 3000 * attempt + Math.floor(Math.random() * 700);
+        console.log(`[market] rate limited, retry ${attempt}/${MAX_ATTEMPTS - 1} in ${(delayMs / 1000).toFixed(1)}s`);
+        await sleep(delayMs);
         continue;
       }
       return res;
     } catch (err) {
-      const limited = String(err.message || '').includes(String(RATE_LIMIT_CODE));
+      const limited = err.code === RATE_LIMIT_CODE || String(err.message || '').includes(String(RATE_LIMIT_CODE));
       if (!limited || attempt === MAX_ATTEMPTS) throw err;
-      console.log(`[market] rate limited (thrown), retry ${attempt}/${MAX_ATTEMPTS - 1} in ${3 * attempt}s`);
-      await sleep(3000 * attempt);
+      const delayMs = 3000 * attempt + Math.floor(Math.random() * 700);
+      console.log(`[market] rate limited (thrown), retry ${attempt}/${MAX_ATTEMPTS - 1} in ${(delayMs / 1000).toFixed(1)}s`);
+      await sleep(delayMs);
     }
   }
 }
@@ -44,14 +51,14 @@ async function fetchLiveSellAds() {
   );
 
   // Surface API-level errors instead of silently returning nothing
-  const code = response.ret_code ?? response.retCode;
+  const code = response && (response.ret_code ?? response.retCode);
   if (code !== undefined && code !== 0) {
     const msg = response.ret_msg ?? response.retMsg ?? '';
     throw new Error(`getOnlineAds failed: ${code} ${msg}`);
   }
 
   const result = response.result || response;
-  const items = result.items || [];
+  const items = result.items || response.items || [];
 
   // One-time log so the real field names can be verified
   if (!loggedKeys && items[0]) {

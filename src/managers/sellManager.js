@@ -4,28 +4,33 @@
 // applies profit floor, and returns a decision for each ad.
 // Does NOT call updateAd directly — the caller (index.js) will do that.
 
-const { client } = require('../bybit/client');
 const { fetchLiveSellAds } = require('../bybit/market');
 const config = require('../config');
 
 // ── Filter: is this ad from a genuine competitor? ─────────
 function isGenuine(ad) {
+  const price = Number(ad.price);
   const rate = Number(ad.completionRate) || 0;
   const orders = Number(ad.recentOrders) || 0;
-  return rate >= config.competitor.minCompletionRate &&
+  return Number.isFinite(price) &&
+         price > 0 &&
+         rate >= config.competitor.minCompletionRate &&
          orders >= config.competitor.minOrders30d;
 }
 
 // ── Exclude your own ads from the competitor list ─────────
 function excludeOwnAds(ads) {
-  const myIds = [config.ads.sellAd1Id, config.ads.sellAd2Id];
+  const myIds = [config.ads.sellAd1Id, config.ads.sellAd2Id]
+    .filter(Boolean)
+    .map(String);
   return ads.filter((ad) => !myIds.includes(String(ad.id)));
 }
 
 // ── Find the cheapest among a filtered list ───────────────
 function findCheapest(ads) {
-  if (ads.length === 0) return null;
-  return ads.reduce((min, ad) =>
+  const valid = ads.filter((ad) => Number.isFinite(Number(ad.price)) && Number(ad.price) > 0);
+  if (valid.length === 0) return null;
+  return valid.reduce((min, ad) =>
     Number(ad.price) < Number(min.price) ? ad : min
   );
 }

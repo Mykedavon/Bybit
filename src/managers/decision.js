@@ -7,28 +7,35 @@
 // is compared against lastQuantity.
 
 const { client } = require('../bybit/client');
+const { scheduleP2P } = require('../bybit/p2pRaw');
 const { fetchCompletedBuys, weightedAvgBuyPrice, profitFloor } = require('../bybit/orders');
 const config = require('../config');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function runP2P(fn) {
+  return typeof scheduleP2P === 'function' ? scheduleP2P(fn) : fn();
+}
+
 // Retry when Bybit answers "too many visits" (ErrCode 10006)
 async function withRetry(label, fn, attempts = 4) {
   for (let i = 1; i <= attempts; i++) {
     try {
-      const res = await fn();
+      const res = await runP2P(fn);
       const code = res && (res.ret_code ?? res.retCode);
       if (code === 10006 && i < attempts) {
-        console.log(`[decision] ${label} rate limited, retry ${i}/${attempts - 1} in ${3 * i}s`);
-        await sleep(3000 * i);
+        const delayMs = 3000 * i + Math.floor(Math.random() * 700);
+        console.log(`[decision] ${label} rate limited, retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`);
+        await sleep(delayMs);
         continue;
       }
       return res;
     } catch (err) {
-      const limited = String(err.message || '').includes('10006');
+      const limited = err.code === 10006 || String(err.message || '').includes('10006');
       if (!limited || i === attempts) throw err;
-      console.log(`[decision] ${label} rate limited (thrown), retry ${i}/${attempts - 1} in ${3 * i}s`);
-      await sleep(3000 * i);
+      const delayMs = 3000 * i + Math.floor(Math.random() * 700);
+      console.log(`[decision] ${label} rate limited (thrown), retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`);
+      await sleep(delayMs);
     }
   }
 }

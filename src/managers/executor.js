@@ -26,6 +26,7 @@ const FIRST_VARIANT = 1; // variant 0 (original format) is known to be rejected
 const LAST_VARIANT = 3;
 const ERROR_COOLDOWN_MS = 5 * 60 * 1000;
 const LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
+const INACTIVE_COOLDOWN_MS = 60 * 1000;
 const PAYMENT_CACHE_MS = 10 * 60 * 1000;
 const EDIT_WINDOW_MS = 5 * 60 * 1000;
 const MAX_EDITS_PER_WINDOW = 8; // Bybit allows 10 per ad per 5 minutes; keep a margin
@@ -61,7 +62,7 @@ function recordEdit(adId) {
 
 // ── Per-ad memory ─────────────────────────────────────────
 const workingVariant = new Map(); // adId -> variant that last succeeded
-const cooldown = new Map();       // adId -> { until, kind: 'limit' | 'error' }
+const cooldown = new Map();       // adId -> { until, kind: 'limit' | 'inactive' | 'error' }
 const originalMax = new Map();    // adId -> max order amount first seen
 const paymentCache = new Map();   // adId -> { ids, at }
 
@@ -83,7 +84,7 @@ async function callWithRateRetry(label, fn, attempts = 4) {
       }
       return res;
     } catch (err) {
-      const limited = String(err.message || '').includes('10006');
+      const limited = err.code === 10006 || String(err.message || '').includes('10006');
       if (!limited || i === attempts) throw err;
       const delayMs = 3000 * i + Math.floor(Math.random() * 600);
       console.log(`[executor] ${label} rate limited (thrown), retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`);
@@ -210,11 +211,14 @@ async function dumpDiagnostics(adId, params) {
 async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityChanged) {
   const adId = adState.id;
 
-  // Cooling down after a rejected request or Bybit's edit limit
+  // Cooling down after a rejected request, inactive ad, or Bybit's edit limit
   const cd = cooldown.get(adId);
   if (cd && Date.now() < cd.until) {
     if (cd.kind === 'limit') {
       return { ok: true, adId, action: 'skipped', reason: 'edit_limit_cooldown' };
+    }
+    if (cd.kind === 'inactive') {
+      return { ok: true, adId, action: 'skipped', reason: 'ad_inactive_cooldown' };
     }
     return { ok: false, adId, reason: 'cooldown_after_error' };
   }
@@ -305,6 +309,9 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
       const msg = String(err.message || '');
       console.error(`[executor] updateAd failed for ad ${adId} (variant ${v}): ${msg}`);
 
+      // Ad is offline/inactive and cannot be modified in its current status
+      if (msg.includes('912300121')) break;
+
       // Price too close to your other ad: not a request problem, stop here
       if (msg.includes('90043')) break;
 
@@ -355,6 +362,12 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
   if (!sent) {
     workingVariant.delete(adId);
     const msg = String((lastErr && lastErr.message) || '');
+
+    if (msg.includes('912300121')) {
+      cooldown.set(adId, { until: Date.now() + INACTIVE_COOLDOWN_MS, kind: 'inactive' });
+      console.log(`[executor] ad ${adId}: ad not modifiable (912300121) — skipping for 60s`);
+      return { ok: true, adId, action: 'skipped', reason: 'ad_inactive_cooldown' };
+    }
 
     if (msg.includes('90043')) {
       // Bybit wants a wider gap between your two ads; the next cycle uses one
