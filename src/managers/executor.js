@@ -14,30 +14,38 @@
 //   verify step compares against lastQuantity too.
 
 const { client } = require('../bybit/client');
-const { p2pPost } = require('../bybit/p2pRaw');
+const { p2pPost, scheduleP2P } = require('../bybit/p2pRaw');
 const { getAdState, noteCollision } = require('./decision');
 const inventory = require('./inventory');
 const config = require('../config');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const floor2 = (n) => Math.floor(Number(n) * 100) / 100;
+const floor2 = (n) => Math.floor(Number(n) * 100 + 1e-9) / 100;
 
 const FIRST_VARIANT = 1; // variant 0 (original format) is known to be rejected
 const LAST_VARIANT = 3;
 const ERROR_COOLDOWN_MS = 5 * 60 * 1000;
 const LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 const PAYMENT_CACHE_MS = 10 * 60 * 1000;
+const EDIT_WINDOW_MS = 5 * 60 * 1000;
 const MAX_EDITS_PER_WINDOW = 8; // Bybit allows 10 per ad per 5 minutes; keep a margin
 
 // ── Edit attempt tracking ─────────────────────────────────
 const editLog = new Map(); // adId -> [timestamps]
 
-function canEdit(adId) {
-  const now = Date.now();
-  const windowStart = now - 5 * 60 * 1000;
+function pruneEditHistory(adId, now = Date.now()) {
+  const windowStart = now - EDIT_WINDOW_MS;
   const history = (editLog.get(adId) || []).filter((t) => t > windowStart);
-  editLog.set(adId, history);
+  if (history.length === 0) {
+    editLog.delete(adId);
+  } else {
+    editLog.set(adId, history);
+  }
+  return history;
+}
 
+function canEdit(adId) {
+  const history = pruneEditHistory(adId);
   if (history.length >= MAX_EDITS_PER_WINDOW) {
     return { allowed: false, countInWindow: history.length };
   }
@@ -45,8 +53,9 @@ function canEdit(adId) {
 }
 
 function recordEdit(adId) {
-  const history = editLog.get(adId) || [];
-  history.push(Date.now());
+  const now = Date.now();
+  const history = pruneEditHistory(adId, now);
+  history.push(now);
   editLog.set(adId, history);
 }
 
@@ -56,6 +65,10 @@ const cooldown = new Map();       // adId -> { until, kind: 'limit' | 'error' }
 const originalMax = new Map();    // adId -> max order amount first seen
 const paymentCache = new Map();   // adId -> { ids, at }
 
+function runP2P(fn) {
+  return typeof scheduleP2P === 'function' ? scheduleP2P(fn) : fn();
+}
+
 // ── Retry on Bybit rate limit (ErrCode 10006) ─────────────
 async function callWithRateRetry(label, fn, attempts = 4) {
   for (let i = 1; i <= attempts; i++) {
@@ -63,16 +76,18 @@ async function callWithRateRetry(label, fn, attempts = 4) {
       const res = await fn();
       const code = res && (res.ret_code ?? res.retCode);
       if (code === 10006 && i < attempts) {
-        console.log(`[executor] ${label} rate limited, retry ${i}/${attempts - 1} in ${3 * i}s`);
-        await sleep(3000 * i);
+        const delayMs = 3000 * i + Math.floor(Math.random() * 600);
+        console.log(`[executor] ${label} rate limited, retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`);
+        await sleep(delayMs);
         continue;
       }
       return res;
     } catch (err) {
       const limited = String(err.message || '').includes('10006');
       if (!limited || i === attempts) throw err;
-      console.log(`[executor] ${label} rate limited (thrown), retry ${i}/${attempts - 1} in ${3 * i}s`);
-      await sleep(3000 * i);
+      const delayMs = 3000 * i + Math.floor(Math.random() * 600);
+      console.log(`[executor] ${label} rate limited (thrown), retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`);
+      await sleep(delayMs);
     }
   }
 }
@@ -157,7 +172,9 @@ function buildParams(variant, adState, price, quantity, paymentIds) {
 async function sendUpdate(adId, params) {
   let res;
   try {
-    res = await callWithRateRetry(`updateAd ${adId}`, () => client.updateAd(params));
+    res = await callWithRateRetry(`updateAd ${adId}`, () =>
+      runP2P(() => client.updateAd(params))
+    );
   } catch (err) {
     if (!String(err.message || '').includes('10006')) recordEdit(adId);
     throw err;
@@ -228,6 +245,15 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
   let quantity = quantityChanged ? newQuantity : adState.lastQuantity;
   let qtyClamped = false;
 
+  if (!Number.isFinite(Number(price)) || Number(price) <= 0 || !Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
+    return {
+      ok: false,
+      adId,
+      reason: 'invalid_price_or_quantity',
+      error: `Invalid price (${price}) or quantity (${quantity})`,
+    };
+  }
+
   // The ad's own payment methods (never guessed)
   let paymentIds;
   try {
@@ -262,7 +288,10 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
     const params = buildParams(v, adState, price, quantity, paymentIds);
 
     // Variant 3 only makes sense if the ad can still fill its minimum order
-    if (v === LAST_VARIANT && Number(params.maxAmount) < Number(adState.minAmount)) break;
+    if (v === LAST_VARIANT && Number(params.maxAmount) < Number(adState.minAmount)) {
+      v += 1;
+      continue;
+    }
 
     lastParams = params;
     try {
@@ -324,6 +353,7 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
   }
 
   if (!sent) {
+    workingVariant.delete(adId);
     const msg = String((lastErr && lastErr.message) || '');
 
     if (msg.includes('90043')) {
@@ -372,9 +402,11 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
       fetchError = err;
       continue;
     }
+    const afterPrice = Number(after?.price);
+    const afterQty = Number(after?.lastQuantity);
     check = {
-      priceOk: !priceChanged || Math.abs(after.price - newPrice) < 0.001,
-      qtyOk: !checkQty || Math.abs(after.lastQuantity - sentQty) < 0.011,
+      priceOk: !priceChanged || (Number.isFinite(afterPrice) && Math.abs(afterPrice - newPrice) < 0.001),
+      qtyOk: !checkQty || (Number.isFinite(afterQty) && Math.abs(afterQty - sentQty) < 0.011),
     };
     if (check.priceOk && check.qtyOk) break;
   }
