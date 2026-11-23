@@ -10,10 +10,12 @@
 //   because the "payments" list on an ad holds payment TYPE ids.
 // - Every update attempt counts toward Bybit's limit of 10 edits per ad per
 //   5 minutes, so attempts (not just successes) are counted here.
+// - Quantity sent is the amount still available (lastQuantity), and the
+//   verify step compares against lastQuantity too.
 
 const { client } = require('../bybit/client');
 const { p2pPost } = require('../bybit/p2pRaw');
-const { getAdState } = require('./decision');
+const { getAdState, noteCollision } = require('./decision');
 const inventory = require('./inventory');
 const config = require('../config');
 
@@ -222,7 +224,8 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
   }
 
   const price = priceChanged ? newPrice : adState.price;
-  let quantity = quantityChanged ? newQuantity : adState.quantity;
+  // Amount still available (lastQuantity), not the ad's total size
+  let quantity = quantityChanged ? newQuantity : adState.lastQuantity;
   let qtyClamped = false;
 
   // The ad's own payment methods (never guessed)
@@ -242,7 +245,7 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
     console.log(
       `[executor] DRY_RUN — would update ad ${adId}: ` +
       `price ${adState.price} -> ${params.price}, ` +
-      `quantity ${adState.quantity} -> ${params.quantity}`
+      `available quantity ${adState.lastQuantity} -> ${params.quantity}`
     );
     console.log('[executor] DRY_RUN params:', JSON.stringify(params));
     return { ok: true, adId, action: 'dry_run', newPrice, newQuantity };
@@ -324,6 +327,8 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
     const msg = String((lastErr && lastErr.message) || '');
 
     if (msg.includes('90043')) {
+      // Bybit wants a wider gap between your two ads; the next cycle uses one
+      noteCollision();
       return { ok: false, adId, reason: 'price_collision', error: msg };
     }
 
@@ -369,7 +374,7 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
     }
     check = {
       priceOk: !priceChanged || Math.abs(after.price - newPrice) < 0.001,
-      qtyOk: !checkQty || Math.abs(after.quantity - sentQty) < 0.011,
+      qtyOk: !checkQty || Math.abs(after.lastQuantity - sentQty) < 0.011,
     };
     if (check.priceOk && check.qtyOk) break;
   }
@@ -385,15 +390,15 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
 
   if (!check.priceOk || !check.qtyOk) {
     console.error(
-      `[executor] VERIFY ad ${adId}: expected price ${newPrice} qty ${sentQty}, ` +
-      `Bybit shows price ${after.price} qty ${after.quantity} (lastQuantity ${after.lastQuantity})`
+      `[executor] VERIFY ad ${adId}: expected price ${newPrice} available qty ${sentQty}, ` +
+      `Bybit shows price ${after.price} available qty ${after.lastQuantity} (total ${after.quantity})`
     );
     return {
       ok: false,
       adId,
       reason: 'verify_failed',
       expected: { price: newPrice, quantity: sentQty },
-      actual: { price: after.price, quantity: after.quantity },
+      actual: { price: after.price, quantity: after.lastQuantity },
     };
   }
 
@@ -404,7 +409,7 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
           : priceChanged ? 'price_only'
           : 'quantity_only',
     newPrice: after.price,
-    newQuantity: after.quantity,
+    newQuantity: after.lastQuantity,
   };
 }
 

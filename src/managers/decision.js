@@ -1,6 +1,10 @@
 // src/managers/decision.js
 // Combines target prices with profit floor and current ad state.
 // Returns one decision per ad: EDIT, SKIP, or BLOCK.
+//
+// Quantity note: on Bybit an ad has "quantity" (total size, including what
+// already sold) and "lastQuantity" (what is still available). The balance
+// is compared against lastQuantity.
 
 const { client } = require('../bybit/client');
 const { fetchCompletedBuys, weightedAvgBuyPrice, profitFloor } = require('../bybit/orders');
@@ -34,11 +38,15 @@ async function getAdState(adId) {
   const response = await withRetry(`getAdInfo ${adId}`, () => client.getAdInfo(adId));
   const data = response.result || response;
 
+  const total = Number(data.quantity);
+  const hasLast = data.lastQuantity !== undefined && data.lastQuantity !== null && data.lastQuantity !== '';
+  const remaining = hasLast ? Number(data.lastQuantity) : total;
+
   return {
     id: adId,
     price: Number(data.price) || 0,
-    quantity: Number(data.quantity) || 0,
-    lastQuantity: Number(data.lastQuantity) || 0,
+    quantity: Number.isFinite(total) ? total : 0,           // total ad size
+    lastQuantity: Number.isFinite(remaining) ? remaining : 0, // still available
     minAmount: data.minAmount,
     maxAmount: data.maxAmount,
     priceType: data.priceType,
@@ -78,13 +86,35 @@ async function getProfitFloor() {
 }
 
 // ── Keep the two ads' prices apart ────────────────────────
-// Bybit rejects two of your own ads at (nearly) the same price (ErrCode 90043).
-// If ad 2's target is within the separation of ad 1's, ad 2 goes below ad 1.
-function separationNgn() {
-  const n = Number(process.env.AD_PRICE_SEPARATION_NGN);
-  return Number.isFinite(n) && n > 0 ? n : 0.05;
+// Bybit rejects two of your own ads at (nearly) the same price (ErrCode 90043)
+// and does not say how far apart they must be. Ad 2 starts a small gap below
+// ad 1; each time Bybit rejects the gap, the executor calls noteCollision()
+// and the next cycle uses a wider one. AD_PRICE_SEPARATION_NGN sets the start.
+const SEPARATION_STEPS = [0.25, 0.5, 1, 1.5, 2, 3];
+
+function initialStep() {
+  const env = Number(process.env.AD_PRICE_SEPARATION_NGN);
+  if (!Number.isFinite(env) || env <= 0) return 0;
+  const i = SEPARATION_STEPS.findIndex((s) => s >= env);
+  return i === -1 ? SEPARATION_STEPS.length - 1 : i;
 }
 
+let separationStep = initialStep();
+
+function separationNgn() {
+  return SEPARATION_STEPS[separationStep];
+}
+
+function noteCollision() {
+  if (separationStep < SEPARATION_STEPS.length - 1) {
+    separationStep += 1;
+    console.log(`[decision] Bybit rejected the price gap — ad 2 will now sit ₦${separationNgn()} below ad 1`);
+  } else {
+    console.log('[decision] Bybit rejected the price gap again at the widest setting — check the ads manually');
+  }
+}
+
+// If ad 2's target is within the separation of ad 1's, ad 2 goes below ad 1.
 function separateTargets(t1, t2) {
   if (!t1 || !t2) return t2;
   if (t1.targetPrice === null || t1.targetPrice === undefined) return t2;
@@ -104,10 +134,12 @@ function separateTargets(t1, t2) {
 // ── Decide for one ad ─────────────────────────────────────
 // Output: { action: 'EDIT'|'SKIP'|'BLOCK', ... }
 function decideForAd(adState, target, spendable, floor) {
+  const currentQty = adState.lastQuantity; // what is still listed
+
   const result = {
     adId: adState.id,
     currentPrice: adState.price,
-    currentQuantity: adState.quantity,
+    currentQuantity: currentQty,
   };
 
   // No genuine competitor → skip price edit
@@ -140,7 +172,7 @@ function decideForAd(adState, target, spendable, floor) {
   }
 
   const priceChanged = Math.abs(adState.price - target.targetPrice) > 0.001;
-  const quantityChanged = Math.abs(adState.quantity - spendable) > 0.01;
+  const quantityChanged = Math.abs(currentQty - spendable) > 0.01;
 
   // Nothing to change
   if (!priceChanged && !quantityChanged) {
@@ -148,7 +180,7 @@ function decideForAd(adState, target, spendable, floor) {
   }
 
   // Zero balance safety: never zero the ad
-  if (spendable === 0 && adState.quantity > 0) {
+  if (spendable === 0 && currentQty > 0) {
     return { ...result, action: 'SKIP', reason: 'zero_balance_safety' };
   }
 
@@ -156,7 +188,7 @@ function decideForAd(adState, target, spendable, floor) {
     ...result,
     action: 'EDIT',
     newPrice: priceChanged ? target.targetPrice : adState.price,
-    newQuantity: quantityChanged ? spendable : adState.quantity,
+    newQuantity: quantityChanged ? spendable : currentQty,
     priceChanged,
     quantityChanged,
     targetPrice: target.targetPrice,
@@ -207,4 +239,5 @@ module.exports = {
   getAdState,
   decideForAd,
   evaluateBothAds,
+  noteCollision,
 };
