@@ -3,15 +3,18 @@
 // Read-modify-write with verify-after-write.
 // DRY_RUN=true: logs what would be sent, never edits an ad.
 //
-// Bybit answers "Request parameter error" (10001) without naming the field,
-// so updates use a short ladder of safe parameter variants (see buildParams).
-// Payment method ids come from the ad's own paymentTerms (item info),
-// because the "payments" list on an ad holds payment TYPE ids, which the
-// update endpoint rejects (ErrCode 912300013).
+// Notes:
+// - Bybit answers "Request parameter error" (10001) without naming the field,
+//   so updates use a short ladder of safe parameter variants (see buildParams).
+// - Payment method ids come from the ad's own paymentTerms (item info),
+//   because the "payments" list on an ad holds payment TYPE ids.
+// - Every update attempt counts toward Bybit's limit of 10 edits per ad per
+//   5 minutes, so attempts (not just successes) are counted here.
 
 const { client } = require('../bybit/client');
 const { p2pPost } = require('../bybit/p2pRaw');
 const { getAdState } = require('./decision');
+const inventory = require('./inventory');
 const config = require('../config');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -20,18 +23,20 @@ const floor2 = (n) => Math.floor(Number(n) * 100) / 100;
 const FIRST_VARIANT = 1; // variant 0 (original format) is known to be rejected
 const LAST_VARIANT = 3;
 const ERROR_COOLDOWN_MS = 5 * 60 * 1000;
+const LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 const PAYMENT_CACHE_MS = 10 * 60 * 1000;
+const MAX_EDITS_PER_WINDOW = 8; // Bybit allows 10 per ad per 5 minutes; keep a margin
 
-// ── Edit throttle tracking ────────────────────────────────
-// Bybit: max 10 edits per 5 minutes per ad.
+// ── Edit attempt tracking ─────────────────────────────────
 const editLog = new Map(); // adId -> [timestamps]
 
 function canEdit(adId) {
   const now = Date.now();
   const windowStart = now - 5 * 60 * 1000;
   const history = (editLog.get(adId) || []).filter((t) => t > windowStart);
+  editLog.set(adId, history);
 
-  if (history.length >= 10) {
+  if (history.length >= MAX_EDITS_PER_WINDOW) {
     return { allowed: false, countInWindow: history.length };
   }
   return { allowed: true, countInWindow: history.length };
@@ -45,7 +50,7 @@ function recordEdit(adId) {
 
 // ── Per-ad memory ─────────────────────────────────────────
 const workingVariant = new Map(); // adId -> variant that last succeeded
-const cooldownUntil = new Map();  // adId -> timestamp
+const cooldown = new Map();       // adId -> { until, kind: 'limit' | 'error' }
 const originalMax = new Map();    // adId -> max order amount first seen
 const paymentCache = new Map();   // adId -> { ids, at }
 
@@ -146,9 +151,18 @@ function buildParams(variant, adState, price, quantity, paymentIds) {
 }
 
 // ── Send one update (retries only on rate limits) ─────────
+// Every attempt that reaches Bybit's edit logic is counted.
 async function sendUpdate(adId, params) {
-  const res = await callWithRateRetry(`updateAd ${adId}`, () => client.updateAd(params));
+  let res;
+  try {
+    res = await callWithRateRetry(`updateAd ${adId}`, () => client.updateAd(params));
+  } catch (err) {
+    if (!String(err.message || '').includes('10006')) recordEdit(adId);
+    throw err;
+  }
+
   const code = res && (res.ret_code ?? res.retCode);
+  if (code !== 10006) recordEdit(adId);
   if (code !== undefined && code !== 0) {
     throw new Error(`${res.ret_msg ?? res.retMsg ?? 'error'} (ErrCode: ${code})`);
   }
@@ -177,20 +191,22 @@ async function dumpDiagnostics(adId, params) {
 async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityChanged) {
   const adId = adState.id;
 
-  // Cooling down after a rejected request
-  if (Date.now() < (cooldownUntil.get(adId) || 0)) {
+  // Cooling down after a rejected request or Bybit's edit limit
+  const cd = cooldown.get(adId);
+  if (cd && Date.now() < cd.until) {
+    if (cd.kind === 'limit') {
+      return { ok: true, adId, action: 'skipped', reason: 'edit_limit_cooldown' };
+    }
     return { ok: false, adId, reason: 'cooldown_after_error' };
   }
 
-  // Rate limit check
+  // Local limit on edit attempts (counts rejected attempts too)
   const rate = canEdit(adId);
   if (!rate.allowed) {
-    return {
-      ok: false,
-      adId,
-      reason: 'rate_limit',
-      countInWindow: rate.countInWindow,
-    };
+    console.log(
+      `[executor] ad ${adId}: ${rate.countInWindow} edit attempts in the last 5 minutes — skipping`
+    );
+    return { ok: true, adId, action: 'skipped', reason: 'edit_limit_local' };
   }
 
   // Sanity guard: refuse large single-step price moves
@@ -206,7 +222,8 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
   }
 
   const price = priceChanged ? newPrice : adState.price;
-  const quantity = quantityChanged ? newQuantity : adState.quantity;
+  let quantity = quantityChanged ? newQuantity : adState.quantity;
+  let qtyClamped = false;
 
   // The ad's own payment methods (never guessed)
   let paymentIds;
@@ -236,6 +253,7 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
   let lastErr = null;
   let lastParams = null;
   let refreshedPayments = false;
+  let refreshedBalance = false;
 
   while (v <= LAST_VARIANT) {
     const params = buildParams(v, adState, price, quantity, paymentIds);
@@ -246,7 +264,6 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
     lastParams = params;
     try {
       await sendUpdate(adId, params);
-      recordEdit(adId);
       workingVariant.set(adId, v);
       sent = params;
       console.log(`[executor] ad ${adId} updated (variant ${v})`);
@@ -255,6 +272,30 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
       lastErr = err;
       const msg = String(err.message || '');
       console.error(`[executor] updateAd failed for ad ${adId} (variant ${v}): ${msg}`);
+
+      // Price too close to your other ad: not a request problem, stop here
+      if (msg.includes('90043')) break;
+
+      // Bybit's limit of 10 edits per ad per 5 minutes: stop and wait
+      if (msg.includes('912120050')) break;
+
+      // Balance changed since the cycle started (e.g. a new order froze funds):
+      // re-read the balance once and retry with the lower quantity
+      if (msg.includes('912120024') && !refreshedBalance) {
+        refreshedBalance = true;
+        try {
+          const fresh = Number(await inventory.getSpendableUsdc());
+          if (Number.isFinite(fresh) && fresh > 0) {
+            quantity = Math.min(Number(quantity), fresh);
+            qtyClamped = true;
+            console.log(`[executor] ad ${adId}: balance changed, retrying with quantity ${quantity}`);
+            continue;
+          }
+        } catch (e) {
+          lastErr = e;
+        }
+        break;
+      }
 
       // Payment method not found: re-read the ad's payment methods once, retry same variant
       if (msg.includes('912300013') && !refreshedPayments) {
@@ -281,11 +322,27 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
 
   if (!sent) {
     const msg = String((lastErr && lastErr.message) || '');
+
+    if (msg.includes('90043')) {
+      return { ok: false, adId, reason: 'price_collision', error: msg };
+    }
+
+    if (msg.includes('912120050')) {
+      cooldown.set(adId, { until: Date.now() + LIMIT_COOLDOWN_MS, kind: 'limit' });
+      console.error(`[executor] ad ${adId}: Bybit edit limit reached — pausing edits for 5 minutes`);
+      return { ok: true, adId, action: 'skipped', reason: 'edit_limit_cooldown' };
+    }
+
+    if (msg.includes('912120024')) {
+      return { ok: false, adId, reason: 'insufficient_balance', error: msg };
+    }
+
     if (msg.includes('10001') || msg.includes('912300013')) {
-      cooldownUntil.set(adId, Date.now() + ERROR_COOLDOWN_MS);
+      cooldown.set(adId, { until: Date.now() + ERROR_COOLDOWN_MS, kind: 'error' });
       console.error(`[executor] ad ${adId}: request rejected — pausing edits for 5 minutes`);
       await dumpDiagnostics(adId, lastParams);
     }
+
     return {
       ok: false,
       adId,
@@ -294,19 +351,43 @@ async function applyEdit(adState, newPrice, newQuantity, priceChanged, quantityC
     };
   }
 
-  // Verify
-  let after;
-  try {
-    after = await getAdState(adId);
-  } catch (err) {
-    return { ok: false, adId, reason: 'verify_fetch_failed', error: err.message };
+  // Verify: give Bybit a moment, read the ad back, try once more if it differs
+  const sentQty = Number(sent.quantity);
+  const checkQty = quantityChanged || qtyClamped;
+  let after = null;
+  let fetchError = null;
+  let check = { priceOk: false, qtyOk: false };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await sleep(attempt === 1 ? 2000 : 3000);
+    try {
+      after = await getAdState(adId);
+      fetchError = null;
+    } catch (err) {
+      fetchError = err;
+      continue;
+    }
+    check = {
+      priceOk: !priceChanged || Math.abs(after.price - newPrice) < 0.001,
+      qtyOk: !checkQty || Math.abs(after.quantity - sentQty) < 0.011,
+    };
+    if (check.priceOk && check.qtyOk) break;
   }
 
-  const sentQty = Number(sent.quantity);
-  const priceOk = !priceChanged || Math.abs(after.price - newPrice) < 0.001;
-  const qtyOk = !quantityChanged || Math.abs(after.quantity - sentQty) < 0.001;
+  if (!after) {
+    return {
+      ok: false,
+      adId,
+      reason: 'verify_fetch_failed',
+      error: fetchError ? fetchError.message : 'unknown',
+    };
+  }
 
-  if (!priceOk || !qtyOk) {
+  if (!check.priceOk || !check.qtyOk) {
+    console.error(
+      `[executor] VERIFY ad ${adId}: expected price ${newPrice} qty ${sentQty}, ` +
+      `Bybit shows price ${after.price} qty ${after.quantity} (lastQuantity ${after.lastQuantity})`
+    );
     return {
       ok: false,
       adId,

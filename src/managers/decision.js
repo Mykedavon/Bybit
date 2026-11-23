@@ -77,6 +77,30 @@ async function getProfitFloor() {
   }
 }
 
+// ── Keep the two ads' prices apart ────────────────────────
+// Bybit rejects two of your own ads at (nearly) the same price (ErrCode 90043).
+// If ad 2's target is within the separation of ad 1's, ad 2 goes below ad 1.
+function separationNgn() {
+  const n = Number(process.env.AD_PRICE_SEPARATION_NGN);
+  return Number.isFinite(n) && n > 0 ? n : 0.05;
+}
+
+function separateTargets(t1, t2) {
+  if (!t1 || !t2) return t2;
+  if (t1.targetPrice === null || t1.targetPrice === undefined) return t2;
+  if (t2.targetPrice === null || t2.targetPrice === undefined) return t2;
+
+  const sep = separationNgn();
+  if (Math.abs(t1.targetPrice - t2.targetPrice) < sep - 1e-9) {
+    const adjusted = Number((t1.targetPrice - sep).toFixed(2));
+    console.log(
+      `[decision] ad 2 target ${t2.targetPrice} is too close to ad 1 (${t1.targetPrice}) — using ${adjusted}`
+    );
+    return { ...t2, targetPrice: adjusted };
+  }
+  return t2;
+}
+
 // ── Decide for one ad ─────────────────────────────────────
 // Output: { action: 'EDIT'|'SKIP'|'BLOCK', ... }
 function decideForAd(adState, target, spendable, floor) {
@@ -159,13 +183,15 @@ async function evaluateBothAds(sellCycleResult, spendable) {
     console.log('[decision] WARNING: no profit floor available — all edits are blocked');
   }
 
-  // Read both ads once per cycle
+  // Read both ads once per cycle (small gap between calls)
   const ad1State = await getAdState(config.ads.sellAd1Id);
+  await sleep(400);
   const ad2State = await getAdState(config.ads.sellAd2Id);
 
   // Decide
+  const ad2Target = separateTargets(sellCycleResult.ad1, sellCycleResult.ad2);
   const ad1Decision = decideForAd(ad1State, sellCycleResult.ad1, spendable, floor);
-  const ad2Decision = decideForAd(ad2State, sellCycleResult.ad2, spendable, floor);
+  const ad2Decision = decideForAd(ad2State, ad2Target, spendable, floor);
 
   return {
     ad1: ad1Decision,
