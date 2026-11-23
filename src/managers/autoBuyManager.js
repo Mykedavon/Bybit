@@ -18,7 +18,6 @@ const { getAdState } = require('./decision');
 const { getSpendableUsdc } = require('./inventory');
 const config = require('../config');
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const floor2 = (n) => Math.floor(Number(n) * 100 + 1e-9) / 100;
 
 const paymentCache = new Map(); // adId -> { ids, at }
@@ -173,14 +172,23 @@ async function isAdOnline(adId) {
 }
 
 async function updateBuyAd(adId, adState, price, quantity, paymentIds) {
+  const cleanQty = floor2(quantity);
+  const rawMin = Number(adState.minAmount || config.autoBuy.minAmountNgn);
+  const rawMax = Number(adState.maxAmount || config.autoBuy.maxAmountNgn);
+  const fillableFiat = Math.floor(Number(price) * cleanQty);
+  const clampedMax = Number.isFinite(rawMax) && rawMax > 0
+    ? Math.min(rawMax, fillableFiat > 0 ? fillableFiat : rawMax)
+    : fillableFiat;
+  const safeMax = Math.max(Number.isFinite(rawMin) && rawMin > 0 ? rawMin : 50000, clampedMax);
+
   const params = {
     id: String(adId),
     priceType: adState.priceType ? String(adState.priceType) : '0',
     premium: '',
     price: String(price),
-    quantity: String(floor2(quantity)),
-    minAmount: String(adState.minAmount || config.autoBuy.minAmountNgn),
-    maxAmount: String(adState.maxAmount || config.autoBuy.maxAmountNgn),
+    quantity: String(cleanQty),
+    minAmount: String(Number.isFinite(rawMin) && rawMin > 0 ? rawMin : config.autoBuy.minAmountNgn),
+    maxAmount: String(safeMax),
     remark: adState.remark || '',
     tradingPreferenceSet: normalizePrefs(adState.tradingPreferenceSet),
     paymentIds,
@@ -190,7 +198,7 @@ async function updateBuyAd(adId, adState, price, quantity, paymentIds) {
 
   if (config.dryRun) {
     console.log(`[autoBuy] DRY_RUN — would update buy ad ${adId}:`, JSON.stringify(params));
-    return { ok: true, action: 'dry_run', price, quantity };
+    return { ok: true, action: 'dry_run', price, quantity: cleanQty };
   }
 
   const res = await runP2P(() => client.updateAd(params));
@@ -199,20 +207,24 @@ async function updateBuyAd(adId, adState, price, quantity, paymentIds) {
     throw new Error(`${res.ret_msg ?? res.retMsg ?? 'error'} (ErrCode: ${code})`);
   }
 
-  return { ok: true, action: 'updated', price, quantity };
+  return { ok: true, action: 'updated', price, quantity: cleanQty };
 }
 
 // ── Main 5-minute cycle ───────────────────────────────────
 async function runAutoBuyCycle() {
   if (running) return { ok: true, skipped: 'already_running' };
-  const buyAdId = config.ads.buyAd1Id;
+  const buyAdId = String(config.ads.buyAd1Id || '').trim();
   if (!buyAdId) {
     return { ok: true, skipped: 'no_buy_ad_id_configured' };
   }
 
   running = true;
+  let step = 'init';
   try {
+    step = 'getSpendableUsdc';
     const spendable = Number(await getSpendableUsdc());
+
+    step = 'isAdOnline';
     const { online, info } = await isAdOnline(buyAdId);
 
     // If the buy ad is currently offline/pending AND spendable >= 200 USDC, do nothing.
@@ -223,7 +235,7 @@ async function runAutoBuyCycle() {
       return { ok: true, action: 'idle', spendable };
     }
 
-    // Fetch & filter buy market
+    step = 'fetchLiveBuyAds';
     const marketBuyAds = await fetchLiveBuyAds(20);
     const others = excludeOwnAds(marketBuyAds);
     const genuine = others.filter(isGenuineBuyer);
@@ -234,6 +246,7 @@ async function runAutoBuyCycle() {
       `matched(>=${config.autoBuy.minCompetitorQtyUsdc} USDC & ₦${config.autoBuy.filterFiatNgn})=${matched.length}`
     );
 
+    step = 'computeBuyTarget';
     const decision = computeBuyTarget(matched);
     if (!decision.targetPrice) {
       console.log('[autoBuy] no matching buy competitor found — skipping');
@@ -245,7 +258,10 @@ async function runAutoBuyCycle() {
       `-> targeting #${decision.rankTarget} at ${decision.targetPrice} (${decision.reason})`
     );
 
+    step = 'getAdState';
     const adState = await getAdState(buyAdId);
+
+    step = 'getPaymentIds';
     const paymentIds = await getPaymentIds(buyAdId);
 
     // Case 1: Ad is currently offline/pending and spendable < 200 -> post/activate with (620 - spendable)
@@ -260,6 +276,7 @@ async function runAutoBuyCycle() {
         return { ok: true, action: 'skipped', reason: 'qty_below_min_limit' };
       }
 
+      step = 'updateBuyAd(activate)';
       const res = await updateBuyAd(buyAdId, adState, decision.targetPrice, buyQty, paymentIds);
       console.log(
         `[autoBuy] posted buy ad ${buyAdId}: qty=${buyQty} USDC (${config.autoBuy.targetTotalUsdc} - ${spendable}) @ ₦${decision.targetPrice}`
@@ -277,14 +294,15 @@ async function runAutoBuyCycle() {
       return { ok: true, action: 'skipped', reason: 'no_price_change_needed' };
     }
 
+    step = 'updateBuyAd(price)';
     const res = await updateBuyAd(buyAdId, adState, decision.targetPrice, remainingQty, paymentIds);
     console.log(
       `[autoBuy] adjusted buy ad ${buyAdId} price: ₦${currentPrice} -> ₦${decision.targetPrice} (rem qty ${remainingQty})`
     );
     return res;
   } catch (err) {
-    console.error('[autoBuy] cycle error:', err.message);
-    return { ok: false, error: err.message };
+    console.error(`[autoBuy] cycle error at step=${step}:`, err.message);
+    return { ok: false, step, error: err.message };
   } finally {
     running = false;
   }
