@@ -25,6 +25,13 @@ function startHealthServer() {
   return server;
 }
 
+const { startAutoBuyScheduler } = require('./managers/autoBuyManager');
+const { startBuyOrderMessaging } = require('./managers/buyOrderMessaging');
+
+// inside startup:
+startAutoBuyScheduler();
+startBuyOrderMessaging();
+
 // Pings our own public URL so the free plan does not put us to sleep.
 function startKeepAwake() {
   const url = process.env.RENDER_EXTERNAL_URL;

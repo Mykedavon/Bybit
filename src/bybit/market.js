@@ -1,5 +1,5 @@
 // src/bybit/market.js
-// Fetches live USDC sell ads from Bybit and normalizes the fields
+// Fetches live USDC sell and buy ads from Bybit and normalizes the fields
 // the rest of the bot relies on. No filtering. No decisions.
 
 const { client } = require('./client');
@@ -40,34 +40,7 @@ async function callWithRetry(fn) {
   }
 }
 
-async function fetchLiveSellAds() {
-  const response = await callWithRetry(() =>
-    client.getOnlineAds({
-      tokenId: config.market.coin,
-      currencyId: config.market.fiat,
-      side: '1', // 1 = sell ads
-      size: config.market.fetchCount,
-    })
-  );
-
-  // Surface API-level errors instead of silently returning nothing
-  const code = response && (response.ret_code ?? response.retCode);
-  if (code !== undefined && code !== 0) {
-    const msg = response.ret_msg ?? response.retMsg ?? '';
-    throw new Error(`getOnlineAds failed: ${code} ${msg}`);
-  }
-
-  const result = response.result || response;
-  const items = result.items || response.items || [];
-
-  // One-time log so the real field names can be verified
-  if (!loggedKeys && items[0]) {
-    console.log('[market] sample ad keys:', Object.keys(items[0]).join(','));
-    loggedKeys = true;
-  }
-
-  console.log(`[market] fetched ${items.length} live sell ads`);
-
+function normalizeItems(items) {
   return items.map((ad) => {
     const rawRate = Number(ad.recentExecuteRate);
     const rate = Number.isNaN(rawRate) ? 0 : rawRate;
@@ -82,4 +55,46 @@ async function fetchLiveSellAds() {
   });
 }
 
-module.exports = { fetchLiveSellAds };
+async function fetchLiveAdsBySide(side, label, fetchSize = config.market.fetchCount) {
+  const response = await callWithRetry(() =>
+    client.getOnlineAds({
+      tokenId: config.market.coin,
+      currencyId: config.market.fiat,
+      side: String(side), // '1' = sell ads, '0' = buy ads
+      size: String(fetchSize),
+    })
+  );
+
+  // Surface API-level errors instead of silently returning nothing
+  const code = response && (response.ret_code ?? response.retCode);
+  if (code !== undefined && code !== 0) {
+    const msg = response.ret_msg ?? response.retMsg ?? '';
+    throw new Error(`getOnlineAds(side=${side}) failed: ${code} ${msg}`);
+  }
+
+  const result = response.result || response;
+  const items = result.items || response.items || [];
+
+  // One-time log so the real field names can be verified
+  if (!loggedKeys && items[0]) {
+    console.log('[market] sample ad keys:', Object.keys(items[0]).join(','));
+    loggedKeys = true;
+  }
+
+  console.log(`[market] fetched ${items.length} live ${label} ads`);
+
+  return normalizeItems(items);
+}
+
+async function fetchLiveSellAds() {
+  return fetchLiveAdsBySide('1', 'sell', config.market.fetchCount);
+}
+
+async function fetchLiveBuyAds(fetchSize = Math.max(config.market.fetchCount, 20)) {
+  return fetchLiveAdsBySide('0', 'buy', fetchSize);
+}
+
+module.exports = {
+  fetchLiveSellAds,
+  fetchLiveBuyAds,
+};

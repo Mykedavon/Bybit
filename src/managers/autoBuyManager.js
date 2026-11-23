@@ -1,0 +1,324 @@
+// src/managers/autoBuyManager.js
+// Monitors spendable USDC and manages BUY_AD_1_ID:
+// - When spendable < 200 USDC and buy ad is offline/pending, activates it with
+//   quantity = (AUTO_BUY_TARGET_USDC - spendable), e.g., 620 - 150 = 470 USDC.
+// - Checks the buy market every 5 minutes from posting while active, adjusting
+//   only the price (until remaining quantity value drops below minAmount and
+//   Bybit automatically takes the ad offline/pending).
+// - Filters buy ads for reliable traders with >= 35 USDC available and whose
+//   fiat range covers 50,000 NGN (minAmount <= 50000 <= maxAmount).
+// - Takes the top 10 highest-priced buy ads, computes their average, and bids
+//   #1 + 0.01 when #1/#2/#3 are within ₦1.00 (and #1 isn't an expensive outlier),
+//   otherwise bids #2 + 0.01 to sit cleanly in 2nd place.
+
+const { client } = require('../bybit/client');
+const { fetchLiveBuyAds } = require('../bybit/market');
+const { p2pPost, scheduleP2P } = require('../bybit/p2pRaw');
+const { getAdState } = require('./decision');
+const { getSpendableUsdc } = require('./inventory');
+const config = require('../config');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const floor2 = (n) => Math.floor(Number(n) * 100 + 1e-9) / 100;
+
+const paymentCache = new Map(); // adId -> { ids, at }
+const PAYMENT_CACHE_MS = 10 * 60 * 1000;
+
+let timer = null;
+let running = false;
+
+function runP2P(fn) {
+  return typeof scheduleP2P === 'function' ? scheduleP2P(fn) : fn();
+}
+
+// ── Filters matching your Bybit screen (genuine, >= 35 USDC, ₦50,000 range) ──
+function isGenuineBuyer(ad) {
+  const price = Number(ad.price);
+  const rate = Number(ad.completionRate) || 0;
+  const orders = Number(ad.recentOrders) || 0;
+
+  return (
+    Number.isFinite(price) &&
+    price > 0 &&
+    rate >= config.competitor.minCompletionRate &&
+    orders >= config.competitor.minOrders30d
+  );
+}
+
+function excludeOwnAds(ads) {
+  const myIds = [
+    config.ads.sellAd1Id,
+    config.ads.sellAd2Id,
+    config.ads.buyAd1Id,
+  ]
+    .filter(Boolean)
+    .map(String);
+
+  return ads.filter((ad) => !myIds.includes(String(ad.id)));
+}
+
+function matchesBuyMarketFilters(ad) {
+  const qty = Number(ad.lastQuantity ?? ad.quantity) || 0;
+  if (qty < config.autoBuy.minCompetitorQtyUsdc) return false;
+
+  const targetFiat = config.autoBuy.filterFiatNgn;
+  const minFiat = Number(ad.minAmount);
+  const maxFiat = Number(ad.maxAmount);
+
+  if (Number.isFinite(minFiat) && minFiat > 0 && targetFiat < minFiat) return false;
+  if (Number.isFinite(maxFiat) && maxFiat > 0 && targetFiat > maxFiat) return false;
+
+  return true;
+}
+
+// ── Top-10 average + #1 vs #2 competitive pricing ─────────
+function computeBuyTarget(filteredAds) {
+  const sortedDesc = [...filteredAds]
+    .filter((ad) => Number.isFinite(Number(ad.price)) && Number(ad.price) > 0)
+    .sort((a, b) => Number(b.price) - Number(a.price));
+
+  if (sortedDesc.length === 0) {
+    return { targetPrice: null, reason: 'no_matching_buy_competitor' };
+  }
+
+  const top10 = sortedDesc.slice(0, 10);
+  const avgTop10 =
+    top10.reduce((sum, ad) => sum + Number(ad.price), 0) / top10.length;
+
+  const first = Number(top10[0].price);
+  const second = top10[1] ? Number(top10[1].price) : null;
+  const third = top10[2] ? Number(top10[2].price) : null;
+
+  const maxSpread = config.autoBuy.maxSpreadNgn; // default 1.00 NGN
+  const step = config.autoBuy.outbidStepNgn;     // default 0.01 NGN
+
+  let anchorPrice = first;
+  let rankTarget = 1;
+  let selectionReason = 'top1_tight_market';
+
+  if (second !== null) {
+    const gap1to2 = first - second;
+    const gap1to3 = third !== null ? first - third : gap1to2;
+    const gap1toAvg = first - avgTop10;
+
+    // If #1, #2, #3 are within ₦1 AND #1 is not far above the top-10 average, take #1.
+    // Otherwise #1 is an expensive outlier — compete with #2 instead.
+    const top3Tight = gap1to2 <= maxSpread + 1e-9 && gap1to3 <= maxSpread + 1e-9;
+    const closeToAvg = gap1toAvg <= maxSpread + 1e-9;
+
+    if (!top3Tight || !closeToAvg) {
+      anchorPrice = second;
+      rankTarget = 2;
+      selectionReason = `top1_outlier(${first}_vs_2nd_${second}_avg_${avgTop10.toFixed(2)})`;
+    }
+  }
+
+  let targetPrice = Number((anchorPrice + step).toFixed(2));
+
+  if (config.autoBuy.maxPriceNgn > 0 && targetPrice > config.autoBuy.maxPriceNgn) {
+    targetPrice = Number(config.autoBuy.maxPriceNgn.toFixed(2));
+    selectionReason += '_clamped_max_price';
+  }
+
+  return {
+    targetPrice,
+    rankTarget,
+    reason: selectionReason,
+    avgTop10: Number(avgTop10.toFixed(2)),
+    firstPrice: first,
+    secondPrice: second,
+    thirdPrice: third,
+    topCompetitor: {
+      price: anchorPrice,
+      nickName: (rankTarget === 1 ? top10[0] : top10[1])?.nickName || 'unknown',
+    },
+  };
+}
+
+// ── Payment IDs & Ad Update Helpers ───────────────────────
+async function getPaymentIds(adId) {
+  const cached = paymentCache.get(adId);
+  if (cached && Date.now() - cached.at < PAYMENT_CACHE_MS) return cached.ids;
+
+  const info = await p2pPost('/v5/p2p/item/info', { itemId: String(adId) });
+  const terms = Array.isArray(info.paymentTerms) ? info.paymentTerms : [];
+  const ids = terms
+    .map((t) => (t && t.id !== undefined && t.id !== null ? String(t.id) : ''))
+    .filter(Boolean);
+
+  if (ids.length === 0) {
+    throw new Error(`buy ad ${adId} has no paymentTerms`);
+  }
+
+  paymentCache.set(adId, { ids, at: Date.now() });
+  return ids;
+}
+
+function normalizePrefs(prefs) {
+  const out = {};
+  for (const [k, v] of Object.entries(prefs || {})) {
+    if (v === null || v === undefined) continue;
+    out[k] = String(v);
+  }
+  return out;
+}
+
+async function isAdOnline(adId) {
+  const info = await p2pPost('/v5/p2p/item/info', { itemId: String(adId) });
+  const status = Number(info.status);
+  const onlineFlag = info.isOnline;
+  // On Bybit P2P, status === 10 (or isOnline === true) indicates live/online
+  const online = onlineFlag === true || status === 10;
+  return { online, info };
+}
+
+async function updateBuyAd(adId, adState, price, quantity, paymentIds) {
+  const params = {
+    id: String(adId),
+    priceType: adState.priceType ? String(adState.priceType) : '0',
+    premium: '',
+    price: String(price),
+    quantity: String(floor2(quantity)),
+    minAmount: String(adState.minAmount || config.autoBuy.minAmountNgn),
+    maxAmount: String(adState.maxAmount || config.autoBuy.maxAmountNgn),
+    remark: adState.remark || '',
+    tradingPreferenceSet: normalizePrefs(adState.tradingPreferenceSet),
+    paymentIds,
+    actionType: 'MODIFY',
+    paymentPeriod: String(adState.paymentPeriod || '15'),
+  };
+
+  if (config.dryRun) {
+    console.log(`[autoBuy] DRY_RUN — would update buy ad ${adId}:`, JSON.stringify(params));
+    return { ok: true, action: 'dry_run', price, quantity };
+  }
+
+  const res = await runP2P(() => client.updateAd(params));
+  const code = res && (res.ret_code ?? res.retCode);
+  if (code !== undefined && code !== 0) {
+    throw new Error(`${res.ret_msg ?? res.retMsg ?? 'error'} (ErrCode: ${code})`);
+  }
+
+  return { ok: true, action: 'updated', price, quantity };
+}
+
+// ── Main 5-minute cycle ───────────────────────────────────
+async function runAutoBuyCycle() {
+  if (running) return { ok: true, skipped: 'already_running' };
+  const buyAdId = config.ads.buyAd1Id;
+  if (!buyAdId) {
+    return { ok: true, skipped: 'no_buy_ad_id_configured' };
+  }
+
+  running = true;
+  try {
+    const spendable = Number(await getSpendableUsdc());
+    const { online, info } = await isAdOnline(buyAdId);
+
+    // If the buy ad is currently offline/pending AND spendable >= 200 USDC, do nothing.
+    if (!online && spendable >= config.autoBuy.triggerBelowUsdc) {
+      console.log(
+        `[autoBuy] spendable (${spendable}) >= ${config.autoBuy.triggerBelowUsdc} USDC and buy ad is offline — idle`
+      );
+      return { ok: true, action: 'idle', spendable };
+    }
+
+    // Fetch & filter buy market
+    const marketBuyAds = await fetchLiveBuyAds(20);
+    const others = excludeOwnAds(marketBuyAds);
+    const genuine = others.filter(isGenuineBuyer);
+    const matched = genuine.filter(matchesBuyMarketFilters);
+
+    console.log(
+      `[autoBuy] buy ads: total=${marketBuyAds.length}, genuine=${genuine.length}, ` +
+      `matched(>=${config.autoBuy.minCompetitorQtyUsdc} USDC & ₦${config.autoBuy.filterFiatNgn})=${matched.length}`
+    );
+
+    const decision = computeBuyTarget(matched);
+    if (!decision.targetPrice) {
+      console.log('[autoBuy] no matching buy competitor found — skipping');
+      return { ok: true, action: 'skipped', reason: decision.reason };
+    }
+
+    console.log(
+      `[autoBuy] top10 avg=${decision.avgTop10}, #1=${decision.firstPrice}, #2=${decision.secondPrice ?? 'N/A'} ` +
+      `-> targeting #${decision.rankTarget} at ${decision.targetPrice} (${decision.reason})`
+    );
+
+    const adState = await getAdState(buyAdId);
+    const paymentIds = await getPaymentIds(buyAdId);
+
+    // Case 1: Ad is currently offline/pending and spendable < 200 -> post/activate with (620 - spendable)
+    if (!online) {
+      const buyQty = floor2(Math.max(0, config.autoBuy.targetTotalUsdc - spendable));
+      const minFillUsdc = Number(adState.minAmount || config.autoBuy.minAmountNgn) / decision.targetPrice;
+
+      if (buyQty <= 0 || buyQty < minFillUsdc) {
+        console.log(
+          `[autoBuy] calculated buyQty (${buyQty} USDC) is below minimum order (${minFillUsdc.toFixed(2)} USDC) — skipping`
+        );
+        return { ok: true, action: 'skipped', reason: 'qty_below_min_limit' };
+      }
+
+      const res = await updateBuyAd(buyAdId, adState, decision.targetPrice, buyQty, paymentIds);
+      console.log(
+        `[autoBuy] posted buy ad ${buyAdId}: qty=${buyQty} USDC (${config.autoBuy.targetTotalUsdc} - ${spendable}) @ ₦${decision.targetPrice}`
+      );
+      return res;
+    }
+
+    // Case 2: Ad is already online/active -> only adjust price; leave remaining quantity untouched
+    // so partial fills wind down naturally until Bybit takes the ad down to pending.
+    const currentPrice = Number(adState.price) || 0;
+    const remainingQty = Number(info.lastQuantity ?? adState.lastQuantity) || 0;
+
+    if (Math.abs(currentPrice - decision.targetPrice) <= 0.001) {
+      console.log(`[autoBuy] buy ad ${buyAdId} already at ₦${currentPrice} (rem qty ${remainingQty}) — no price edit needed`);
+      return { ok: true, action: 'skipped', reason: 'no_price_change_needed' };
+    }
+
+    const res = await updateBuyAd(buyAdId, adState, decision.targetPrice, remainingQty, paymentIds);
+    console.log(
+      `[autoBuy] adjusted buy ad ${buyAdId} price: ₦${currentPrice} -> ₦${decision.targetPrice} (rem qty ${remainingQty})`
+    );
+    return res;
+  } catch (err) {
+    console.error('[autoBuy] cycle error:', err.message);
+    return { ok: false, error: err.message };
+  } finally {
+    running = false;
+  }
+}
+
+function startAutoBuyScheduler() {
+  if (timer) return;
+  const intervalMs = config.autoBuy.pollSeconds * 1000;
+  console.log(
+    `[autoBuy] scheduler started (every ${config.autoBuy.pollSeconds}s, trigger < ${config.autoBuy.triggerBelowUsdc} USDC, target = ${config.autoBuy.targetTotalUsdc} - available)`
+  );
+
+  setTimeout(() => {
+    runAutoBuyCycle().catch(() => {});
+  }, 4000);
+
+  timer = setInterval(() => {
+    runAutoBuyCycle().catch(() => {});
+  }, intervalMs);
+}
+
+function stopAutoBuyScheduler() {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+}
+
+module.exports = {
+  isGenuineBuyer,
+  excludeOwnAds,
+  matchesBuyMarketFilters,
+  computeBuyTarget,
+  runAutoBuyCycle,
+  startAutoBuyScheduler,
+  stopAutoBuyScheduler,
+};

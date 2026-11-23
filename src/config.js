@@ -41,6 +41,7 @@ module.exports = {
   ads: {
     sellAd1Id: process.env.SELL_AD_1_ID,
     sellAd2Id: process.env.SELL_AD_2_ID,
+    buyAd1Id: str('BUY_AD_1_ID', ''),
   },
 
   market: {
@@ -52,6 +53,29 @@ module.exports = {
   pricing: {
     undercutNgn: num('UNDERCUT_NGN', 0.05),
     bulkMinQuantity: num('BULK_MIN_QUANTITY', 150),
+  },
+
+  autoBuy: {
+    triggerBelowUsdc: num('AUTO_BUY_TRIGGER_USDC', 200),
+    targetTotalUsdc: num('AUTO_BUY_TARGET_USDC', 620),
+    minCompetitorQtyUsdc: num('AUTO_BUY_MIN_QTY_USDC', 35),
+    filterFiatNgn: num('AUTO_BUY_FILTER_FIAT_NGN', 50000),
+    minAmountNgn: num('AUTO_BUY_MIN_AMOUNT_NGN', 50000),
+    maxAmountNgn: num('AUTO_BUY_MAX_AMOUNT_NGN', 500000),
+    outbidStepNgn: num('AUTO_BUY_OUTBID_NGN', 0.01),
+    maxSpreadNgn: num('AUTO_BUY_MAX_SPREAD_NGN', 1.0),
+    maxPriceNgn: num('AUTO_BUY_MAX_PRICE_NGN', 0), // 0 = no hard ceiling
+    pollSeconds: num('AUTO_BUY_POLL_SECONDS', 300), // 5 minutes
+  },
+
+  buyMessaging: {
+    mode: str('BUY_ORDER_MESSAGING', 'on').trim().toLowerCase(),
+    pollSeconds: num('BUY_ORDER_POLL_SECONDS', 5),
+    reviewMsg1: str('BUY_REVIEW_MSG_1', 'Please don\'t forget to give me a positive review.'),
+    reviewMsg2: str('BUY_REVIEW_MSG_2', 'It will mean a lot!'),
+    reminderStartSeconds: num('BUY_REMINDER_START_SECONDS', 300), // 5 minutes
+    reminderIntervalSeconds: num('BUY_REMINDER_INTERVAL_SECONDS', 60), // 1 minute
+    maxReminders: num('BUY_MAX_REMINDERS', 10),
   },
 
   competitor: {
