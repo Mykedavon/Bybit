@@ -1,14 +1,14 @@
-// src/managers/decision.js
-// Combines target prices with profit floor and current ad state.
-// Returns one decision per ad: EDIT, SKIP, or BLOCK.
-//
-// Quantity note: on Bybit an ad has "quantity" (total size, including what
-// already sold) and "lastQuantity" (what is still available). The balance
-// is compared against lastQuantity.
+
+ // src/managers/decision.js
+// Combines ranked competitor targets with separate safety floors and ad state.
+// Ad 1 safety: weighted average buy + ₦9
+// Ad 2 safety: weighted average buy + ₦10
+// If a competitor's undercut target is below safety, skip that competitor
+// and select the next competitor that can be safely undercut.
 
 const { client } = require('../bybit/client');
 const { scheduleP2P } = require('../bybit/p2pRaw');
-const { fetchCompletedBuys, weightedAvgBuyPrice, profitFloor } = require('../bybit/orders');
+const { fetchCompletedBuys, weightedAvgBuyPrice } = require('../bybit/orders');
 const config = require('../config');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -23,18 +23,25 @@ async function withRetry(label, fn, attempts = 4) {
     try {
       const res = await runP2P(fn);
       const code = res && (res.ret_code ?? res.retCode);
+
       if (code === 10006 && i < attempts) {
         const delayMs = 3000 * i + Math.floor(Math.random() * 700);
-        console.log(`[decision] ${label} rate limited, retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`);
+        console.log(
+          `[decision] ${label} rate limited, retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`
+        );
         await sleep(delayMs);
         continue;
       }
+
       return res;
     } catch (err) {
       const limited = err.code === 10006 || String(err.message || '').includes('10006');
       if (!limited || i === attempts) throw err;
+
       const delayMs = 3000 * i + Math.floor(Math.random() * 700);
-      console.log(`[decision] ${label} rate limited (thrown), retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`);
+      console.log(
+        `[decision] ${label} rate limited (thrown), retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`
+      );
       await sleep(delayMs);
     }
   }
@@ -46,14 +53,17 @@ async function getAdState(adId) {
   const data = response.result || response;
 
   const total = Number(data.quantity);
-  const hasLast = data.lastQuantity !== undefined && data.lastQuantity !== null && data.lastQuantity !== '';
+  const hasLast =
+    data.lastQuantity !== undefined &&
+    data.lastQuantity !== null &&
+    data.lastQuantity !== '';
   const remaining = hasLast ? Number(data.lastQuantity) : total;
 
   return {
     id: adId,
     price: Number(data.price) || 0,
-    quantity: Number.isFinite(total) ? total : 0,           // total ad size
-    lastQuantity: Number.isFinite(remaining) ? remaining : 0, // still available
+    quantity: Number.isFinite(total) ? total : 0,
+    lastQuantity: Number.isFinite(remaining) ? remaining : 0,
     minAmount: data.minAmount,
     maxAmount: data.maxAmount,
     priceType: data.priceType,
@@ -65,42 +75,58 @@ async function getAdState(adId) {
   };
 }
 
-// ── Profit floor (cached) ─────────────────────────────────
-// Completed buys change rarely, so fetch at most every 5 minutes.
-// If a fetch fails, reuse the last known floor for up to 30 minutes.
+// ── Weighted-average buy-price cache ───────────────────────
 const FLOOR_TTL_MS = 5 * 60 * 1000;
 const FLOOR_STALE_MAX_MS = 30 * 60 * 1000;
-let floorCache = { at: 0, floor: null, weightedAvg: null };
+
+let floorCache = {
+  at: 0,
+  weightedAvg: null,
+  ad1Floor: null,
+  ad2Floor: null,
+};
 
 async function getProfitFloor() {
   const age = Date.now() - floorCache.at;
-  if (floorCache.at && age < FLOOR_TTL_MS) return floorCache;
+
+  if (floorCache.at && age < FLOOR_TTL_MS) {
+    return floorCache;
+  }
 
   try {
     const buys = await withRetry('completed buys', () => fetchCompletedBuys());
     const weightedAvg = weightedAvgBuyPrice(buys);
-    let floor = profitFloor(weightedAvg);
-    floor = Number.isFinite(floor) ? floor : null;
-    floorCache = { at: Date.now(), floor, weightedAvg };
+
+    const ad1Floor = weightedAvg === null ? null : Number((weightedAvg + 9).toFixed(2));
+    const ad2Floor = weightedAvg === null ? null : Number((weightedAvg + 10).toFixed(2));
+
+    floorCache = {
+      at: Date.now(),
+      weightedAvg,
+      ad1Floor,
+      ad2Floor,
+    };
+
     return floorCache;
   } catch (err) {
     if (floorCache.at && age < FLOOR_STALE_MAX_MS) {
-      console.log(`[decision] buys fetch failed (${err.message}) — reusing floor from ${Math.round(age / 1000)}s ago`);
+      console.log(
+        `[decision] buys fetch failed (${err.message}) — reusing weighted average from ${Math.round(age / 1000)}s ago`
+      );
       return floorCache;
     }
+
     throw err;
   }
 }
 
 // ── Keep the two ads' prices apart (Ad 2 always >= Ad 1) ──
-// Bybit rejects two of your own ads at (nearly) the same price (ErrCode 90043)
-// and does not say how far apart they must be. Ad 2 stays at least `sep` above
-// ad 1 so ad 2 is never cheaper than ad 1.
 const SEPARATION_STEPS = [0.25, 0.5, 1, 1.5, 2, 3];
 
 function initialStep() {
   const env = Number(process.env.AD_PRICE_SEPARATION_NGN);
   if (!Number.isFinite(env) || env <= 0) return 0;
+
   const i = SEPARATION_STEPS.findIndex((s) => s >= env);
   return i === -1 ? SEPARATION_STEPS.length - 1 : i;
 }
@@ -114,14 +140,17 @@ function separationNgn() {
 function noteCollision() {
   if (separationStep < SEPARATION_STEPS.length - 1) {
     separationStep += 1;
-    console.log(`[decision] Bybit rejected the price gap — ad 2 will now sit ₦${separationNgn()} above ad 1`);
+    console.log(
+      `[decision] Bybit rejected the price gap — ad 2 will now sit ₦${separationNgn()} above ad 1`
+    );
   } else {
-    console.log('[decision] Bybit rejected the price gap again at the widest setting — check the ads manually');
+    console.log(
+      '[decision] Bybit rejected the price gap again at the widest setting — check the ads manually'
+    );
   }
 }
 
-// Ad 2 must never be cheaper than ad 1: if ad 2's target is below ad 1's
-// (or closer than `sep` above ad 1's), lift ad 2 to `ad1.targetPrice + sep`.
+// Ad 2 must never be cheaper than Ad 1 or too close to it.
 function separateTargets(t1, t2) {
   if (!t1 || !t2) return t2;
   if (t1.targetPrice === null || t1.targetPrice === undefined) return t2;
@@ -134,15 +163,82 @@ function separateTargets(t1, t2) {
     console.log(
       `[decision] ad 2 target ${t2.targetPrice} is below/too close to ad 1 (${t1.targetPrice}) — using ${minAd2Price}`
     );
-    return { ...t2, targetPrice: minAd2Price };
+
+    return {
+      ...t2,
+      targetPrice: minAd2Price,
+      reason: 'ad_separation',
+    };
   }
+
   return t2;
+}
+
+// ── Select the first competitor whose undercut is safe ────
+// Candidates arrive sorted cheapest-to-most-expensive.
+// Safety floor is a restriction, not a price target.
+// If no competitor can be safely undercut, fall back to the floor.
+function selectSafeTarget(originalTarget, floor, adLabel) {
+  if (!originalTarget || originalTarget.targetPrice === null) {
+    return originalTarget || { targetPrice: null, reason: 'no_genuine_competitor' };
+  }
+
+  const candidates = Array.isArray(originalTarget.candidates)
+    ? originalTarget.candidates
+    : null;
+
+  // Compatibility with a target that doesn't contain candidate lists.
+  if (!candidates) {
+    if (originalTarget.targetPrice >= floor) return originalTarget;
+
+    console.log(
+      `[decision] ${adLabel} target ${originalTarget.targetPrice} is below safety ${floor}; using safety fallback`
+    );
+
+    return {
+      ...originalTarget,
+      targetPrice: floor,
+      reason: 'safety_floor_fallback',
+    };
+  }
+
+  const eligible = candidates.find(
+    (candidate) => Number(candidate.targetPrice) >= floor
+  );
+
+  if (eligible) {
+    if (eligible.targetPrice !== candidates[0].targetPrice) {
+      console.log(
+        `[decision] ${adLabel}: skipped unsafe competitor(s); targeting ${eligible.competitor.price} at ${eligible.targetPrice}`
+      );
+    }
+
+    return {
+      targetPrice: eligible.targetPrice,
+      cheapest: eligible.competitor,
+      candidates,
+      reason: 'safe_competitor_target',
+    };
+  }
+
+  // No competitor can be safely undercut; stay at the floor rather than
+  // chasing an unsafe competitor.
+  console.log(
+    `[decision] ${adLabel}: no safe competitor target found — falling back to safety floor ${floor}`
+  );
+
+  return {
+    targetPrice: floor,
+    cheapest: null,
+    candidates,
+    reason: 'safety_floor_fallback',
+  };
 }
 
 // ── Decide for one ad ─────────────────────────────────────
 // Output: { action: 'EDIT'|'SKIP'|'BLOCK', ... }
 function decideForAd(adState, target, spendable, floor) {
-  const currentQty = adState.lastQuantity; // what is still listed
+  const currentQty = adState.lastQuantity;
 
   const result = {
     adId: adState.id,
@@ -151,11 +247,11 @@ function decideForAd(adState, target, spendable, floor) {
   };
 
   // No genuine competitor → skip price edit
-  if (target.targetPrice === null) {
-    return { ...result, action: 'SKIP', reason: target.reason };
+  if (!target || target.targetPrice === null || target.targetPrice === undefined) {
+    return { ...result, action: 'SKIP', reason: target?.reason || 'no_genuine_competitor' };
   }
 
-  // No profit floor available → never edit (fail closed)
+  // No safety floor available → never edit (fail closed)
   if (floor === null || floor === undefined) {
     return {
       ...result,
@@ -167,7 +263,7 @@ function decideForAd(adState, target, spendable, floor) {
     };
   }
 
-  // ── Check profit floor ────────────────────────────────
+  // Final safety check
   if (target.targetPrice < floor) {
     return {
       ...result,
@@ -201,26 +297,39 @@ function decideForAd(adState, target, spendable, floor) {
     quantityChanged,
     targetPrice: target.targetPrice,
     cheapest: target.cheapest,
+    targetReason: target.reason,
   };
 }
 
 // ── Main: evaluate both ads ──────────────────────────────
-// Output: { ad1, ad2, ad1State, ad2State, floor, weightedAvg }
 async function evaluateBothAds(sellCycleResult, spendable) {
   const cached = await getProfitFloor();
   const weightedAvg = cached.weightedAvg;
-  let floor = cached.floor;
 
-  // Optional manual floor when there is no buy history yet
-  if (floor === null && config.profit.manualFloor > 0) {
-    floor = config.profit.manualFloor;
-    console.log(`[decision] using MANUAL_PROFIT_FLOOR: ${floor}`);
+  let ad1Floor = cached.ad1Floor;
+  let ad2Floor = cached.ad2Floor;
+
+  // Optional manual floor when no buy history exists.
+  // It is used as the safety floor for both ads if weighted average is missing.
+  if (weightedAvg === null && config.profit.manualFloor > 0) {
+    ad1Floor = config.profit.manualFloor;
+    ad2Floor = config.profit.manualFloor;
+
+    console.log(`[decision] using MANUAL_PROFIT_FLOOR: ${config.profit.manualFloor}`);
   }
 
-  console.log(`[decision] weighted avg buy: ${weightedAvg ? Number(weightedAvg).toFixed(2) : 'N/A'}`);
-  console.log(`[decision] profit floor: ${floor !== null ? floor.toFixed(2) : 'N/A'}`);
-  if (floor === null) {
-    console.log('[decision] WARNING: no profit floor available — all edits are blocked');
+  console.log(
+    `[decision] weighted avg buy: ${weightedAvg !== null ? Number(weightedAvg).toFixed(2) : 'N/A'}`
+  );
+  console.log(
+    `[decision] Ad 1 safety floor (+9): ${ad1Floor !== null ? ad1Floor.toFixed(2) : 'N/A'}`
+  );
+  console.log(
+    `[decision] Ad 2 safety floor (+10): ${ad2Floor !== null ? ad2Floor.toFixed(2) : 'N/A'}`
+  );
+
+  if (ad1Floor === null || ad2Floor === null) {
+    console.log('[decision] WARNING: no safety floor available — edits without a floor are blocked');
   }
 
   // Read both ads once per cycle (small gap between calls)
@@ -228,17 +337,24 @@ async function evaluateBothAds(sellCycleResult, spendable) {
   await sleep(400);
   const ad2State = await getAdState(config.ads.sellAd2Id);
 
-  // Decide
-  const ad2Target = separateTargets(sellCycleResult.ad1, sellCycleResult.ad2);
-  const ad1Decision = decideForAd(ad1State, sellCycleResult.ad1, spendable, floor);
-  const ad2Decision = decideForAd(ad2State, ad2Target, spendable, floor);
+  // Choose the first safely undercuttable competitor for each ad.
+  const ad1Target = selectSafeTarget(sellCycleResult.ad1, ad1Floor, 'Ad 1');
+  const ad2Target = selectSafeTarget(sellCycleResult.ad2, ad2Floor, 'Ad 2');
+
+  // Keep Ad 2 separated from Ad 1.
+  const separatedAd2Target = separateTargets(ad1Target, ad2Target);
+
+  const ad1Decision = decideForAd(ad1State, ad1Target, spendable, ad1Floor);
+  const ad2Decision = decideForAd(ad2State, separatedAd2Target, spendable, ad2Floor);
 
   return {
     ad1: ad1Decision,
     ad2: ad2Decision,
     ad1State,
     ad2State,
-    floor,
+    floor: ad2Floor,
+    ad1Floor,
+    ad2Floor,
     weightedAvg,
   };
 }

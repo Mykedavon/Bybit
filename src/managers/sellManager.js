@@ -1,8 +1,9 @@
-// src/managers/sellManager.js
+
+ // src/managers/sellManager.js
 // The sell-side decision maker.
-// Fetches market, filters genuine competitors, computes target prices,
-// applies profit floor, and returns a decision for each ad.
-// Does NOT call updateAd directly — the caller (index.js) will do that.
+// Fetches live market ads, filters genuine competitors, and returns
+// ranked targets for Ad 1 (general market) and Ad 2 (bulk market).
+// Safety-floor selection is handled by decision.js.
 
 const { fetchLiveSellAds } = require('../bybit/market');
 const config = require('../config');
@@ -12,10 +13,11 @@ function isGenuine(ad) {
   const price = Number(ad.price);
   const rate = Number(ad.completionRate) || 0;
   const orders = Number(ad.recentOrders) || 0;
+
   return Number.isFinite(price) &&
-         price > 0 &&
-         rate >= config.competitor.minCompletionRate &&
-         orders >= config.competitor.minOrders30d;
+    price > 0 &&
+    rate >= config.competitor.minCompletionRate &&
+    orders >= config.competitor.minOrders30d;
 }
 
 // ── Exclude your own ads from the competitor list ─────────
@@ -23,38 +25,57 @@ function excludeOwnAds(ads) {
   const myIds = [config.ads.sellAd1Id, config.ads.sellAd2Id]
     .filter(Boolean)
     .map(String);
+
   return ads.filter((ad) => !myIds.includes(String(ad.id)));
 }
 
-// ── Find the cheapest among a filtered list ───────────────
-function findCheapest(ads) {
-  const valid = ads.filter((ad) => Number.isFinite(Number(ad.price)) && Number(ad.price) > 0);
-  if (valid.length === 0) return null;
-  return valid.reduce((min, ad) =>
-    Number(ad.price) < Number(min.price) ? ad : min
-  );
+// ── Sort competitors from cheapest to most expensive ──────
+function sortByPrice(ads) {
+  return ads
+    .filter((ad) => Number.isFinite(Number(ad.price)) && Number(ad.price) > 0)
+    .sort((a, b) => Number(a.price) - Number(b.price));
 }
 
-// ── Compute target price for one ad ───────────────────────
-// Returns { targetPrice, cheapest, reason }
+// ── Build ranked undercut targets ─────────────────────────
+function buildCandidates(competitorPool) {
+  return sortByPrice(competitorPool).map((ad) => {
+    const targetPrice = Number(
+      (Number(ad.price) - config.pricing.undercutNgn).toFixed(2)
+    );
+
+    return {
+      targetPrice,
+      competitor: {
+        price: Number(ad.price),
+        nickName: ad.nickName || 'unknown',
+        quantity: Number(ad.quantity) || 0,
+      },
+    };
+  });
+}
+
+// ── Legacy-style initial target (lowest competitor) ──────
 function computeTarget(competitorPool) {
-  const cheapest = findCheapest(competitorPool);
-  if (!cheapest) {
-    return { targetPrice: null, reason: 'no_genuine_competitor' };
+  const candidates = buildCandidates(competitorPool);
+  if (candidates.length === 0) {
+    return {
+      targetPrice: null,
+      candidates: [],
+      reason: 'no_genuine_competitor',
+    };
   }
-  const target = Number(cheapest.price) - config.pricing.undercutNgn;
+
+  const first = candidates[0];
+
   return {
-    targetPrice: Number(target.toFixed(2)),
-    cheapest: {
-      price: Number(cheapest.price),
-      nickName: cheapest.nickName || 'unknown',
-      quantity: Number(cheapest.quantity) || 0,
-    },
+    targetPrice: first.targetPrice,
+    cheapest: first.competitor,
+    candidates,
     reason: 'ok',
   };
 }
 
-// ── Main cycle: fetch, filter, decide ─────────────────────
+// ── Main cycle: fetch, filter, prepare candidates ────────
 async function runSellCycle() {
   console.log('[sell] cycle started');
 
@@ -62,7 +83,11 @@ async function runSellCycle() {
   try {
     marketAds = await fetchLiveSellAds();
   } catch (err) {
-    return { ok: false, reason: 'market_fetch_failed', error: err.message };
+    return {
+      ok: false,
+      reason: 'market_fetch_failed',
+      error: err.message,
+    };
   }
 
   if (!marketAds || marketAds.length === 0) {
@@ -73,7 +98,7 @@ async function runSellCycle() {
   const competitors = excludeOwnAds(marketAds);
   console.log(`[sell] ${competitors.length} competitors after excluding own ads`);
 
-  // Filter genuine
+  // Filter genuine competitors
   const genuine = competitors.filter(isGenuine);
   console.log(`[sell] ${genuine.length} genuine competitors after filter`);
 
@@ -84,19 +109,25 @@ async function runSellCycle() {
   // ── Ad 1: general market ──────────────────────────────
   const ad1Target = computeTarget(genuine);
 
-  // ── Ad 2: bulk market (filter by quantity) ────────────
+  // ── Ad 2: bulk market ────────────────────────────────
   const bulkPool = genuine.filter(
     (ad) => Number(ad.quantity) >= config.pricing.bulkMinQuantity
   );
-  console.log(`[sell] ${bulkPool.length} bulk competitors (>= ${config.pricing.bulkMinQuantity} USDC)`);
+
+  console.log(
+    `[sell] ${bulkPool.length} bulk competitors (>= ${config.pricing.bulkMinQuantity} USDC)`
+  );
+
   const ad2Target = computeTarget(bulkPool);
 
   return {
     ok: true,
+
     ad1: {
       adId: config.ads.sellAd1Id,
       ...ad1Target,
     },
+
     ad2: {
       adId: config.ads.sellAd2Id,
       ...ad2Target,
@@ -107,7 +138,8 @@ async function runSellCycle() {
 module.exports = {
   isGenuine,
   excludeOwnAds,
-  findCheapest,
+  sortByPrice,
+  buildCandidates,
   computeTarget,
   runSellCycle,
 };
