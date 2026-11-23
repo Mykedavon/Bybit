@@ -13,8 +13,7 @@
 
 const { client } = require('../bybit/client');
 const { fetchLiveBuyAds } = require('../bybit/market');
-const { p2pPost, scheduleP2P } = require('../bybit/p2pRaw');
-const { getAdState } = require('./decision');
+const { scheduleP2P } = require('../bybit/p2pRaw');
 const { getSpendableUsdc } = require('./inventory');
 const config = require('../config');
 
@@ -28,6 +27,10 @@ let running = false;
 
 function runP2P(fn) {
   return typeof scheduleP2P === 'function' ? scheduleP2P(fn) : fn();
+}
+
+function cleanAdId(raw) {
+  return String(raw || '').trim().replace(/^['"]|['"]$/g, '');
 }
 
 // ── Filters matching your Bybit screen (genuine, >= 35 USDC, ₦50,000 range) ──
@@ -46,12 +49,10 @@ function isGenuineBuyer(ad) {
 
 function excludeOwnAds(ads) {
   const myIds = [
-    config.ads.sellAd1Id,
-    config.ads.sellAd2Id,
-    config.ads.buyAd1Id,
-  ]
-    .filter(Boolean)
-    .map(String);
+    cleanAdId(config.ads.sellAd1Id),
+    cleanAdId(config.ads.sellAd2Id),
+    cleanAdId(config.ads.buyAd1Id),
+  ].filter(Boolean);
 
   return ads.filter((ad) => !myIds.includes(String(ad.id)));
 }
@@ -134,12 +135,20 @@ function computeBuyTarget(filteredAds) {
   };
 }
 
-// ── Payment IDs & Ad Update Helpers ───────────────────────
-async function getPaymentIds(adId) {
+// ── Read ad info via SDK (matches decision.js) ────────────
+async function fetchBuyAdInfo(adId) {
+  const response = await runP2P(() => client.getAdInfo(adId));
+  const code = response && (response.ret_code ?? response.retCode);
+  if (code !== undefined && code !== 0) {
+    throw new Error(`${response.ret_msg ?? response.retMsg ?? 'error'} (ErrCode: ${code})`);
+  }
+  return response.result || response;
+}
+
+function extractPaymentIds(adId, info) {
   const cached = paymentCache.get(adId);
   if (cached && Date.now() - cached.at < PAYMENT_CACHE_MS) return cached.ids;
 
-  const info = await p2pPost('/v5/p2p/item/info', { itemId: String(adId) });
   const terms = Array.isArray(info.paymentTerms) ? info.paymentTerms : [];
   const ids = terms
     .map((t) => (t && t.id !== undefined && t.id !== null ? String(t.id) : ''))
@@ -162,19 +171,10 @@ function normalizePrefs(prefs) {
   return out;
 }
 
-async function isAdOnline(adId) {
-  const info = await p2pPost('/v5/p2p/item/info', { itemId: String(adId) });
-  const status = Number(info.status);
-  const onlineFlag = info.isOnline;
-  // On Bybit P2P, status === 10 (or isOnline === true) indicates live/online
-  const online = onlineFlag === true || status === 10;
-  return { online, info };
-}
-
-async function updateBuyAd(adId, adState, price, quantity, paymentIds) {
+async function updateBuyAd(adId, info, price, quantity, paymentIds) {
   const cleanQty = floor2(quantity);
-  const rawMin = Number(adState.minAmount || config.autoBuy.minAmountNgn);
-  const rawMax = Number(adState.maxAmount || config.autoBuy.maxAmountNgn);
+  const rawMin = Number(info.minAmount || config.autoBuy.minAmountNgn);
+  const rawMax = Number(info.maxAmount || config.autoBuy.maxAmountNgn);
   const fillableFiat = Math.floor(Number(price) * cleanQty);
   const clampedMax = Number.isFinite(rawMax) && rawMax > 0
     ? Math.min(rawMax, fillableFiat > 0 ? fillableFiat : rawMax)
@@ -183,17 +183,17 @@ async function updateBuyAd(adId, adState, price, quantity, paymentIds) {
 
   const params = {
     id: String(adId),
-    priceType: adState.priceType ? String(adState.priceType) : '0',
+    priceType: info.priceType ? String(info.priceType) : '0',
     premium: '',
     price: String(price),
     quantity: String(cleanQty),
     minAmount: String(Number.isFinite(rawMin) && rawMin > 0 ? rawMin : config.autoBuy.minAmountNgn),
     maxAmount: String(safeMax),
-    remark: adState.remark || '',
-    tradingPreferenceSet: normalizePrefs(adState.tradingPreferenceSet),
+    remark: info.remark || '',
+    tradingPreferenceSet: normalizePrefs(info.tradingPreferenceSet),
     paymentIds,
     actionType: 'MODIFY',
-    paymentPeriod: String(adState.paymentPeriod || '15'),
+    paymentPeriod: String(info.paymentPeriod || '15'),
   };
 
   if (config.dryRun) {
@@ -213,7 +213,7 @@ async function updateBuyAd(adId, adState, price, quantity, paymentIds) {
 // ── Main 5-minute cycle ───────────────────────────────────
 async function runAutoBuyCycle() {
   if (running) return { ok: true, skipped: 'already_running' };
-  const buyAdId = String(config.ads.buyAd1Id || '').trim();
+  const buyAdId = cleanAdId(config.ads.buyAd1Id);
   if (!buyAdId) {
     return { ok: true, skipped: 'no_buy_ad_id_configured' };
   }
@@ -224,8 +224,10 @@ async function runAutoBuyCycle() {
     step = 'getSpendableUsdc';
     const spendable = Number(await getSpendableUsdc());
 
-    step = 'isAdOnline';
-    const { online, info } = await isAdOnline(buyAdId);
+    step = `fetchBuyAdInfo(${buyAdId})`;
+    const info = await fetchBuyAdInfo(buyAdId);
+    const status = Number(info.status);
+    const online = info.isOnline === true || status === 10;
 
     // If the buy ad is currently offline/pending AND spendable >= 200 USDC, do nothing.
     if (!online && spendable >= config.autoBuy.triggerBelowUsdc) {
@@ -258,16 +260,13 @@ async function runAutoBuyCycle() {
       `-> targeting #${decision.rankTarget} at ${decision.targetPrice} (${decision.reason})`
     );
 
-    step = 'getAdState';
-    const adState = await getAdState(buyAdId);
-
-    step = 'getPaymentIds';
-    const paymentIds = await getPaymentIds(buyAdId);
+    step = 'extractPaymentIds';
+    const paymentIds = extractPaymentIds(buyAdId, info);
 
     // Case 1: Ad is currently offline/pending and spendable < 200 -> post/activate with (620 - spendable)
     if (!online) {
       const buyQty = floor2(Math.max(0, config.autoBuy.targetTotalUsdc - spendable));
-      const minFillUsdc = Number(adState.minAmount || config.autoBuy.minAmountNgn) / decision.targetPrice;
+      const minFillUsdc = Number(info.minAmount || config.autoBuy.minAmountNgn) / decision.targetPrice;
 
       if (buyQty <= 0 || buyQty < minFillUsdc) {
         console.log(
@@ -277,7 +276,7 @@ async function runAutoBuyCycle() {
       }
 
       step = 'updateBuyAd(activate)';
-      const res = await updateBuyAd(buyAdId, adState, decision.targetPrice, buyQty, paymentIds);
+      const res = await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds);
       console.log(
         `[autoBuy] posted buy ad ${buyAdId}: qty=${buyQty} USDC (${config.autoBuy.targetTotalUsdc} - ${spendable}) @ ₦${decision.targetPrice}`
       );
@@ -286,8 +285,10 @@ async function runAutoBuyCycle() {
 
     // Case 2: Ad is already online/active -> only adjust price; leave remaining quantity untouched
     // so partial fills wind down naturally until Bybit takes the ad down to pending.
-    const currentPrice = Number(adState.price) || 0;
-    const remainingQty = Number(info.lastQuantity ?? adState.lastQuantity) || 0;
+    const currentPrice = Number(info.price) || 0;
+    const total = Number(info.quantity);
+    const hasLast = info.lastQuantity !== undefined && info.lastQuantity !== null && info.lastQuantity !== '';
+    const remainingQty = hasLast ? Number(info.lastQuantity) : total;
 
     if (Math.abs(currentPrice - decision.targetPrice) <= 0.001) {
       console.log(`[autoBuy] buy ad ${buyAdId} already at ₦${currentPrice} (rem qty ${remainingQty}) — no price edit needed`);
@@ -295,7 +296,7 @@ async function runAutoBuyCycle() {
     }
 
     step = 'updateBuyAd(price)';
-    const res = await updateBuyAd(buyAdId, adState, decision.targetPrice, remainingQty, paymentIds);
+    const res = await updateBuyAd(buyAdId, info, decision.targetPrice, remainingQty, paymentIds);
     console.log(
       `[autoBuy] adjusted buy ad ${buyAdId} price: ₦${currentPrice} -> ₦${decision.targetPrice} (rem qty ${remainingQty})`
     );
