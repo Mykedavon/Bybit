@@ -1,10 +1,11 @@
-
- // src/managers/decision.js
+// src/managers/decision.js
 // Combines ranked competitor targets with separate safety floors and ad state.
-// Ad 1 safety: weighted average buy + ₦9
-// Ad 2 safety: weighted average buy + ₦10
+// Ad 2 safety: weighted average buy + MIN_PROFIT_PER_USDC (env)
+// Ad 1 safety: ad 2's margin reduced by AD1_MARGIN_DISCOUNT_PCT (env, default 10%)
 // If a competitor's undercut target is below safety, skip that competitor
 // and select the next competitor that can be safely undercut.
+// Ad 2 also must stay above ad 1 by a gap, so it picks the next competitor
+// it can undercut above that level.
 
 const { client } = require('../bybit/client');
 const { scheduleP2P } = require('../bybit/p2pRaw');
@@ -75,6 +76,21 @@ async function getAdState(adId) {
   };
 }
 
+// ── Safety margins (from .env) ─────────────────────────────
+// Ad 2 margin = AD2_MARGIN_NGN if set, otherwise MIN_PROFIT_PER_USDC (default 10).
+// Ad 1 margin = ad 2 margin reduced by AD1_MARGIN_DISCOUNT_PCT (default 10,
+// so 10 -> 9). Set the discount to 0 to give both ads the same margin.
+function getMargins() {
+  const ad2 = Number(process.env.AD2_MARGIN_NGN);
+  const disc = Number(process.env.AD1_MARGIN_DISCOUNT_PCT);
+  const base = Number(config.profit.minProfitPerUsdc);
+  const fallback = Number.isFinite(base) && base > 0 ? base : 10;
+  const ad2Margin = Number.isFinite(ad2) && ad2 > 0 ? ad2 : fallback;
+  const discPct = Number.isFinite(disc) && disc >= 0 && disc < 100 ? disc : 10;
+  const ad1Margin = Number((ad2Margin * (1 - discPct / 100)).toFixed(2));
+  return { ad1Margin, ad2Margin };
+}
+
 // ── Weighted-average buy-price cache ───────────────────────
 const FLOOR_TTL_MS = 5 * 60 * 1000;
 const FLOOR_STALE_MAX_MS = 30 * 60 * 1000;
@@ -97,8 +113,9 @@ async function getProfitFloor() {
     const buys = await withRetry('completed buys', () => fetchCompletedBuys());
     const weightedAvg = weightedAvgBuyPrice(buys);
 
-    const ad1Floor = weightedAvg === null ? null : Number((weightedAvg + 9).toFixed(2));
-    const ad2Floor = weightedAvg === null ? null : Number((weightedAvg + 10).toFixed(2));
+    const { ad1Margin, ad2Margin } = getMargins();
+    const ad1Floor = weightedAvg === null ? null : Number((weightedAvg + ad1Margin).toFixed(2));
+    const ad2Floor = weightedAvg === null ? null : Number((weightedAvg + ad2Margin).toFixed(2));
 
     floorCache = {
       at: Date.now(),
@@ -150,7 +167,7 @@ function noteCollision() {
   }
 }
 
-// Ad 2 must never be cheaper than Ad 1 or too close to it.
+// Safety net: ad 2 must never be cheaper than ad 1 or too close to it.
 function separateTargets(t1, t2) {
   if (!t1 || !t2) return t2;
   if (t1.targetPrice === null || t1.targetPrice === undefined) return t2;
@@ -177,8 +194,13 @@ function separateTargets(t1, t2) {
 // ── Select the first competitor whose undercut is safe ────
 // Candidates arrive sorted cheapest-to-most-expensive.
 // Safety floor is a restriction, not a price target.
-// If no competitor can be safely undercut, fall back to the floor.
-function selectSafeTarget(originalTarget, floor, adLabel) {
+// minPrice (used for ad 2) is ad 1's price plus the gap: competitors whose
+// undercut would land below it are skipped too.
+// If no competitor can be safely undercut, fall back to the lower bound.
+function selectSafeTarget(originalTarget, floor, adLabel, minPrice = null) {
+  // Lowest price this ad may take: its safety floor, and (for ad 2) ad 1's price + gap.
+  const lowerBound = Math.max(Number(floor) || 0, Number(minPrice) || 0);
+
   if (!originalTarget || originalTarget.targetPrice === null) {
     return originalTarget || { targetPrice: null, reason: 'no_genuine_competitor' };
   }
@@ -189,21 +211,21 @@ function selectSafeTarget(originalTarget, floor, adLabel) {
 
   // Compatibility with a target that doesn't contain candidate lists.
   if (!candidates) {
-    if (originalTarget.targetPrice >= floor) return originalTarget;
+    if (originalTarget.targetPrice >= lowerBound) return originalTarget;
 
     console.log(
-      `[decision] ${adLabel} target ${originalTarget.targetPrice} is below safety ${floor}; using safety fallback`
+      `[decision] ${adLabel} target ${originalTarget.targetPrice} is below safety ${lowerBound}; using safety fallback`
     );
 
     return {
       ...originalTarget,
-      targetPrice: floor,
+      targetPrice: lowerBound,
       reason: 'safety_floor_fallback',
     };
   }
 
   const eligible = candidates.find(
-    (candidate) => Number(candidate.targetPrice) >= floor
+    (candidate) => Number(candidate.targetPrice) >= lowerBound
   );
 
   if (eligible) {
@@ -221,14 +243,14 @@ function selectSafeTarget(originalTarget, floor, adLabel) {
     };
   }
 
-  // No competitor can be safely undercut; stay at the floor rather than
+  // No competitor can be safely undercut; stay at the lower bound rather than
   // chasing an unsafe competitor.
   console.log(
-    `[decision] ${adLabel}: no safe competitor target found — falling back to safety floor ${floor}`
+    `[decision] ${adLabel}: no safe competitor target found — falling back to ${lowerBound}`
   );
 
   return {
-    targetPrice: floor,
+    targetPrice: lowerBound,
     cheapest: null,
     candidates,
     reason: 'safety_floor_fallback',
@@ -321,11 +343,12 @@ async function evaluateBothAds(sellCycleResult, spendable) {
   console.log(
     `[decision] weighted avg buy: ${weightedAvg !== null ? Number(weightedAvg).toFixed(2) : 'N/A'}`
   );
+  const margins = getMargins();
   console.log(
-    `[decision] Ad 1 safety floor (+9): ${ad1Floor !== null ? ad1Floor.toFixed(2) : 'N/A'}`
+    `[decision] Ad 1 safety floor (+${margins.ad1Margin}): ${ad1Floor !== null ? ad1Floor.toFixed(2) : 'N/A'}`
   );
   console.log(
-    `[decision] Ad 2 safety floor (+10): ${ad2Floor !== null ? ad2Floor.toFixed(2) : 'N/A'}`
+    `[decision] Ad 2 safety floor (+${margins.ad2Margin}): ${ad2Floor !== null ? ad2Floor.toFixed(2) : 'N/A'}`
   );
 
   if (ad1Floor === null || ad2Floor === null) {
@@ -339,9 +362,16 @@ async function evaluateBothAds(sellCycleResult, spendable) {
 
   // Choose the first safely undercuttable competitor for each ad.
   const ad1Target = selectSafeTarget(sellCycleResult.ad1, ad1Floor, 'Ad 1');
-  const ad2Target = selectSafeTarget(sellCycleResult.ad2, ad2Floor, 'Ad 2');
 
-  // Keep Ad 2 separated from Ad 1.
+  // Ad 2 must stay above ad 1 by the required gap, so it picks the next
+  // competitor it can undercut above that level instead of being pushed up.
+  const ad2MinPrice =
+    ad1Target && ad1Target.targetPrice !== null && ad1Target.targetPrice !== undefined
+      ? Number((ad1Target.targetPrice + separationNgn()).toFixed(2))
+      : null;
+  const ad2Target = selectSafeTarget(sellCycleResult.ad2, ad2Floor, 'Ad 2', ad2MinPrice);
+
+  // Safety net: keep Ad 2 separated from Ad 1.
   const separatedAd2Target = separateTargets(ad1Target, ad2Target);
 
   const ad1Decision = decideForAd(ad1State, ad1Target, spendable, ad1Floor);
