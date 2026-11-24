@@ -1,19 +1,21 @@
 // src/managers/autoBuyManager.js
 // Monitors spendable USDC and manages BUY_AD_1_ID:
-// - When spendable < AUTO_BUY_TRIGGER_USDC and the buy ad is offline, or online but
+// - "Owned" USDC = spendable + USDC on hold in pending sell orders.
+//   Wanted buy quantity = AUTO_BUY_TARGET_USDC - owned (recalculated every cycle).
+// - When owned < AUTO_BUY_TRIGGER_USDC and the buy ad is offline, or online but
 //   stuck below the minimum order, it edits the ad (price from the buy market,
-//   quantity = AUTO_BUY_TARGET_USDC - spendable) and makes sure it is online
-//   (MODIFY for a stuck online ad, ACTIVE relist for an offline one).
-// - While the ad is online it only adjusts the price every AUTO_BUY_POLL_SECONDS.
-//   Bybit takes the ad offline by itself when the remaining value drops below the
-//   minimum order.
+//   wanted quantity) and makes sure it is online (MODIFY for a stuck online ad,
+//   ACTIVE relist for an offline one).
+// - While the ad is online, every cycle it re-syncs BOTH the price and the quantity
+//   (so a cancelled or new sell order is reflected). Bybit takes the ad offline by
+//   itself when the remaining value drops below the minimum order.
 // - Competitors: reliable traders with enough USDC whose limits cover
 //   AUTO_BUY_FILTER_FIAT_NGN. Bids #1 + step when the top 3 are tight, else #2 + step.
 
 const { client } = require('../bybit/client');
 const { fetchLiveBuyAds } = require('../bybit/market');
 const { scheduleP2P } = require('../bybit/p2pRaw');
-const { getSpendableUsdc } = require('./inventory');
+const { getUsdcBalances } = require('./inventory');
 const config = require('../config');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -21,6 +23,9 @@ const floor2 = (n) => Math.floor(Number(n) * 100 + 1e-9) / 100;
 const fmt = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(2) : 'n/a');
 
 const STATUS_LABEL = { 10: 'online', 20: 'offline', 30: 'completed' };
+
+// Quantity changes smaller than this (USDC) are not worth an edit
+const QTY_TOLERANCE = 0.5;
 
 const paymentCache = new Map(); // adId -> { ids, at }
 const PAYMENT_CACHE_MS = 10 * 60 * 1000;
@@ -241,8 +246,10 @@ async function runAutoBuyCycle() {
   running = true;
   let step = 'init';
   try {
-    step = 'getSpendableUsdc';
-    const spendable = Number(await getSpendableUsdc());
+    step = 'getUsdcBalances';
+    const { spendable, onHold } = await getUsdcBalances();
+    const owned = spendable + onHold; // USDC you hold, including pending sell orders
+    const desiredQty = floor2(Math.max(0, config.autoBuy.targetTotalUsdc - owned));
 
     step = `fetchBuyAdInfo(${buyAdId})`;
     const info = await fetchBuyAdInfo(buyAdId);
@@ -258,15 +265,18 @@ async function runAutoBuyCycle() {
     const needsPost = !online || stuck;
 
     console.log(
-      `[autoBuy] spendable ${fmt(spendable)} USDC | buy ad ${STATUS_LABEL[status] || `status ${status}`}` +
-        `${stuck ? ' [below minimum order]' : ''} ` +
-        `(price ${fmt(info.price)}, left ${fmt(info.lastQuantity ?? info.quantity)} USDC) | trigger < ${trigger}`
+      `[autoBuy] USDC: spendable ${fmt(spendable)} + on hold ${fmt(onHold)} = ${fmt(owned)} | ` +
+        `wanted buy qty ${config.autoBuy.targetTotalUsdc} - ${fmt(owned)} = ${fmt(desiredQty)} | trigger < ${trigger}`
+    );
+    console.log(
+      `[autoBuy] buy ad ${STATUS_LABEL[status] || `status ${status}`}${stuck ? ' [below minimum order]' : ''} ` +
+        `(price ${fmt(info.price)}, left ${fmt(info.lastQuantity ?? info.quantity)} USDC)`
     );
 
-    // Needs posting but enough USDC → nothing to do.
-    if (needsPost && spendable >= trigger) {
+    // Needs posting but you already own enough USDC → nothing to do.
+    if (needsPost && owned >= trigger) {
       logQuiet(
-        `[autoBuy] idle: spendable ${fmt(spendable)} is not below ${trigger} and the buy ad is ${stuck ? 'below the minimum order' : 'offline'}`
+        `[autoBuy] idle: owned ${fmt(owned)} is not below ${trigger} and the buy ad is ${stuck ? 'below the minimum order' : 'offline'}`
       );
       return { ok: true, action: 'idle', spendable };
     }
@@ -287,9 +297,14 @@ async function runAutoBuyCycle() {
       return { ok: true, action: 'skipped', reason: decision.reason };
     }
 
+    const lowQty = genuine.filter(
+      (ad) => (Number(ad.lastQuantity ?? ad.quantity) || 0) < config.autoBuy.minCompetitorQtyUsdc
+    ).length;
+    const rangeOut = genuine.length - matched.length - lowQty;
     console.log(
-      `[autoBuy] market: ${marketBuyAds.length} ads, ${genuine.length} genuine, ${matched.length} usable | ` +
-        `top: ${decision.topPrices.join(', ')} | top-10 avg ${decision.avgTop10}`
+      `[autoBuy] market: ${marketBuyAds.length} ads, ${genuine.length} genuine, ${matched.length} usable ` +
+        `(${lowQty} under ${config.autoBuy.minCompetitorQtyUsdc} USDC, ${rangeOut} range excludes ₦${config.autoBuy.filterFiatNgn}) | ` +
+        `top usable: ${decision.topPrices.join(', ')} | avg ${decision.avgTop10}`
     );
     console.log(
       `[autoBuy] target ₦${decision.targetPrice}: ${decision.reason} (+${config.autoBuy.outbidStepNgn})`
@@ -301,7 +316,7 @@ async function runAutoBuyCycle() {
     // Case 1: ad offline (or stuck below the minimum order) and spendable below
     // trigger → edit it and make sure it is online
     if (needsPost) {
-      const buyQty = floor2(Math.max(0, config.autoBuy.targetTotalUsdc - spendable));
+      const buyQty = desiredQty;
       const minFillUsdc =
         Number(info.minAmount || config.autoBuy.minAmountNgn) / decision.targetPrice;
 
@@ -313,7 +328,7 @@ async function runAutoBuyCycle() {
       }
 
       console.log(
-        `[autoBuy] posting buy ad: ${config.autoBuy.targetTotalUsdc} target - ${fmt(spendable)} spendable = ${fmt(buyQty)} USDC @ ₦${decision.targetPrice}`
+        `[autoBuy] posting buy ad: ${config.autoBuy.targetTotalUsdc} target - ${fmt(owned)} owned = ${fmt(buyQty)} USDC @ ₦${decision.targetPrice}`
       );
 
       step = 'updateBuyAd(post)';
@@ -345,43 +360,62 @@ async function runAutoBuyCycle() {
       const afterStatus = Number(after.status);
       console.log(
         `[autoBuy] after posting: ${STATUS_LABEL[afterStatus] || `status ${afterStatus}`} | ` +
-          `price ${fmt(after.price)} | qty ${fmt(after.quantity)} USDC` +
+          `price ${fmt(after.price)} | USDC left ${fmt(after.lastQuantity ?? after.quantity)} (ad total ${fmt(after.quantity)})` +
           (afterStatus === 10 ? ' — LIVE' : ' — NOT LIVE, check the ad on Bybit')
       );
       return res;
     }
 
-    // Case 2: ad already online → only adjust price, leave remaining quantity alone
+    // Case 2: ad online → keep BOTH price and quantity in sync every cycle
     const currentPrice = Number(info.price) || 0;
     const total = Number(info.quantity);
     const hasLast =
       info.lastQuantity !== undefined && info.lastQuantity !== null && info.lastQuantity !== '';
     const remainingQty = hasLast ? Number(info.lastQuantity) : total;
 
-    if (Math.abs(currentPrice - decision.targetPrice) <= 0.001) {
+    const minOrderNgn = Number(info.minAmount) || config.autoBuy.minAmountNgn;
+    const priceSame = Math.abs(currentPrice - decision.targetPrice) <= 0.001;
+
+    // Resize to the wanted quantity unless it would fall below the minimum order
+    // (then the target is nearly reached and the ad is left to wind down).
+    const canResize = desiredQty * decision.targetPrice >= minOrderNgn;
+    const qtySame = Math.abs(remainingQty - desiredQty) < QTY_TOLERANCE;
+    const newQty = canResize && !qtySame ? desiredQty : remainingQty;
+    const qtyChanged = newQty !== remainingQty;
+
+    if (!canResize && !qtySame) {
       logQuiet(
-        `[autoBuy] buy ad already at ₦${currentPrice} (${fmt(remainingQty)} USDC left) — no price change needed`
+        `[autoBuy] wanted qty ${fmt(desiredQty)} USDC is below the minimum order — target nearly reached, leaving quantity at ${fmt(remainingQty)}`
       );
-      return { ok: true, action: 'skipped', reason: 'no_price_change_needed' };
+    }
+
+    if (priceSame && !qtyChanged) {
+      logQuiet(
+        `[autoBuy] buy ad in sync: ₦${currentPrice}, ${fmt(remainingQty)} USDC (wanted ${fmt(desiredQty)}) — no edit needed`
+      );
+      return { ok: true, action: 'skipped', reason: 'in_sync' };
     }
     lastQuietMsg = null;
 
-    // Bybit rejects any edit when remaining value is below the minimum order
+    // Bybit rejects any edit when the value is below the minimum order
     // (error 912120023). The ad is about to wind down, so leave it.
-    const minOrderNgn = Number(info.minAmount) || config.autoBuy.minAmountNgn;
-    const remainingValueNgn = remainingQty * decision.targetPrice;
-    if (remainingValueNgn < minOrderNgn) {
+    if (newQty * decision.targetPrice < minOrderNgn) {
       console.log(
-        `[autoBuy] leaving ad as is: ${fmt(remainingQty)} USDC left (~₦${Math.floor(remainingValueNgn)}) is below the minimum order ₦${minOrderNgn}`
+        `[autoBuy] leaving ad as is: ${fmt(newQty)} USDC (~₦${Math.floor(newQty * decision.targetPrice)}) is below the minimum order ₦${minOrderNgn}`
       );
-      return { ok: true, action: 'skipped', reason: 'remaining_below_min_order' };
+      return { ok: true, action: 'skipped', reason: 'below_min_order' };
     }
 
-    step = 'updateBuyAd(price)';
-    const res = await updateBuyAd(buyAdId, info, decision.targetPrice, remainingQty, paymentIds);
-    console.log(
-      `[autoBuy] price changed ₦${currentPrice} → ₦${decision.targetPrice} (${fmt(remainingQty)} USDC left)`
-    );
+    step = 'updateBuyAd(sync)';
+    const res = await updateBuyAd(buyAdId, info, decision.targetPrice, newQty, paymentIds);
+    const changes = [];
+    if (!priceSame) changes.push(`price ₦${currentPrice} → ₦${decision.targetPrice}`);
+    if (qtyChanged) {
+      changes.push(
+        `qty ${fmt(remainingQty)} → ${fmt(newQty)} USDC (${config.autoBuy.targetTotalUsdc} - ${fmt(owned)} owned)`
+      );
+    }
+    console.log(`[autoBuy] buy ad updated: ${changes.join(', ')}`);
     return res;
   } catch (err) {
     console.error(`[autoBuy] cycle error at step=${step}:`, err.message);
