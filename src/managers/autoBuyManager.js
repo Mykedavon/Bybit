@@ -1,15 +1,13 @@
 // src/managers/autoBuyManager.js
 // Monitors spendable USDC and manages BUY_AD_1_ID:
-// - When spendable < 200 USDC and buy ad is offline/pending, activates it with
-//   quantity = (AUTO_BUY_TARGET_USDC - spendable), e.g., 620 - 150 = 470 USDC.
-// - Checks the buy market every 5 minutes from posting while active, adjusting
-//   only the price (until remaining quantity value drops below minAmount and
-//   Bybit automatically takes the ad offline/pending).
-// - Filters buy ads for reliable traders with >= 35 USDC available and whose
-//   fiat range covers 50,000 NGN (minAmount <= 50000 <= maxAmount).
-// - Takes the top 10 highest-priced buy ads, computes their average, and bids
-//   #1 + 0.01 when #1/#2/#3 are within ₦1.00 (and #1 isn't an expensive outlier),
-//   otherwise bids #2 + 0.01 to sit cleanly in 2nd place.
+// - When spendable < AUTO_BUY_TRIGGER_USDC and the buy ad is offline, it edits the ad
+//   (price from the buy market, quantity = AUTO_BUY_TARGET_USDC - spendable) and
+//   relists it as ACTIVE, even if Bybit had taken it offline.
+// - While the ad is online it only adjusts the price every AUTO_BUY_POLL_SECONDS.
+//   Bybit takes the ad offline by itself when the remaining value drops below the
+//   minimum order.
+// - Competitors: reliable traders with enough USDC whose limits cover
+//   AUTO_BUY_FILTER_FIAT_NGN. Bids #1 + step when the top 3 are tight, else #2 + step.
 
 const { client } = require('../bybit/client');
 const { fetchLiveBuyAds } = require('../bybit/market');
@@ -17,23 +15,36 @@ const { scheduleP2P } = require('../bybit/p2pRaw');
 const { getSpendableUsdc } = require('./inventory');
 const config = require('../config');
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const floor2 = (n) => Math.floor(Number(n) * 100 + 1e-9) / 100;
+const fmt = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(2) : 'n/a');
+
+const STATUS_LABEL = { 10: 'online', 20: 'offline', 30: 'completed' };
 
 const paymentCache = new Map(); // adId -> { ids, at }
 const PAYMENT_CACHE_MS = 10 * 60 * 1000;
 
 let timer = null;
 let running = false;
+let lastQuietMsg = null; // repeated "nothing to do" lines are printed once
 
 function runP2P(fn) {
   return typeof scheduleP2P === 'function' ? scheduleP2P(fn) : fn();
+}
+
+// Print a "nothing happened" line only when it changes
+function logQuiet(msg) {
+  if (msg !== lastQuietMsg) {
+    console.log(msg);
+    lastQuietMsg = msg;
+  }
 }
 
 function cleanAdId(raw) {
   return String(raw || '').trim().replace(/^['"]|['"]$/g, '');
 }
 
-// ── Filters matching your Bybit screen (genuine, >= 35 USDC, ₦50,000 range) ──
+// ── Filters (genuine trader, enough USDC, range covers your size) ──
 function isGenuineBuyer(ad) {
   const price = Number(ad.price);
   const rate = Number(ad.completionRate) || 0;
@@ -82,34 +93,31 @@ function computeBuyTarget(filteredAds) {
   }
 
   const top10 = sortedDesc.slice(0, 10);
-  const avgTop10 =
-    top10.reduce((sum, ad) => sum + Number(ad.price), 0) / top10.length;
+  const avgTop10 = top10.reduce((sum, ad) => sum + Number(ad.price), 0) / top10.length;
 
   const first = Number(top10[0].price);
   const second = top10[1] ? Number(top10[1].price) : null;
   const third = top10[2] ? Number(top10[2].price) : null;
 
   const maxSpread = config.autoBuy.maxSpreadNgn; // default 1.00 NGN
-  const step = config.autoBuy.outbidStepNgn;     // default 0.01 NGN
+  const step = config.autoBuy.outbidStepNgn; // default 0.01 NGN
 
   let anchorPrice = first;
   let rankTarget = 1;
-  let selectionReason = 'top1_tight_market';
+  let selectionReason = 'top 3 are close together, bidding above #1';
 
   if (second !== null) {
     const gap1to2 = first - second;
     const gap1to3 = third !== null ? first - third : gap1to2;
     const gap1toAvg = first - avgTop10;
 
-    // If #1, #2, #3 are within ₦1 AND #1 is not far above the top-10 average, take #1.
-    // Otherwise #1 is an expensive outlier — compete with #2 instead.
     const top3Tight = gap1to2 <= maxSpread + 1e-9 && gap1to3 <= maxSpread + 1e-9;
     const closeToAvg = gap1toAvg <= maxSpread + 1e-9;
 
     if (!top3Tight || !closeToAvg) {
       anchorPrice = second;
       rankTarget = 2;
-      selectionReason = `top1_outlier(${first}_vs_2nd_${second}_avg_${avgTop10.toFixed(2)})`;
+      selectionReason = `#1 (${first}) looks like an outlier vs #2 (${second}) / avg ${avgTop10.toFixed(2)}, bidding above #2`;
     }
   }
 
@@ -117,7 +125,7 @@ function computeBuyTarget(filteredAds) {
 
   if (config.autoBuy.maxPriceNgn > 0 && targetPrice > config.autoBuy.maxPriceNgn) {
     targetPrice = Number(config.autoBuy.maxPriceNgn.toFixed(2));
-    selectionReason += '_clamped_max_price';
+    selectionReason += ` (capped at AUTO_BUY_MAX_PRICE_NGN ${config.autoBuy.maxPriceNgn})`;
   }
 
   return {
@@ -128,21 +136,30 @@ function computeBuyTarget(filteredAds) {
     firstPrice: first,
     secondPrice: second,
     thirdPrice: third,
-    topCompetitor: {
-      price: anchorPrice,
-      nickName: (rankTarget === 1 ? top10[0] : top10[1])?.nickName || 'unknown',
-    },
+    topPrices: top10.slice(0, 5).map((ad) => Number(ad.price)),
   };
 }
 
-// ── Read ad info via SDK (matches decision.js) ────────────
-async function fetchBuyAdInfo(adId) {
-  const response = await runP2P(() => client.getAdInfo(adId));
-  const code = response && (response.ret_code ?? response.retCode);
-  if (code !== undefined && code !== 0) {
-    throw new Error(`${response.ret_msg ?? response.retMsg ?? 'error'} (ErrCode: ${code})`);
+// ── Read ad info via SDK (retries on rate limit) ──────────
+async function fetchBuyAdInfo(adId, attempts = 4) {
+  for (let i = 1; i <= attempts; i++) {
+    const response = await runP2P(() => client.getAdInfo(adId));
+    const code = response && (response.ret_code ?? response.retCode);
+
+    if (code === 10006 && i < attempts) {
+      const delayMs = 3000 * i + Math.floor(Math.random() * 700);
+      console.log(
+        `[autoBuy] getAdInfo rate limited, retry ${i}/${attempts - 1} in ${(delayMs / 1000).toFixed(1)}s`
+      );
+      await sleep(delayMs);
+      continue;
+    }
+
+    if (code !== undefined && code !== 0) {
+      throw new Error(`${response.ret_msg ?? response.retMsg ?? 'error'} (ErrCode: ${code})`);
+    }
+    return response.result || response;
   }
-  return response.result || response;
 }
 
 function extractPaymentIds(adId, info) {
@@ -171,14 +188,16 @@ function normalizePrefs(prefs) {
   return out;
 }
 
-async function updateBuyAd(adId, info, price, quantity, paymentIds) {
+// actionType: 'MODIFY' edits the ad, 'ACTIVE' relists (re-onlines) it
+async function updateBuyAd(adId, info, price, quantity, paymentIds, actionType = 'MODIFY') {
   const cleanQty = floor2(quantity);
   const rawMin = Number(info.minAmount || config.autoBuy.minAmountNgn);
   const rawMax = Number(info.maxAmount || config.autoBuy.maxAmountNgn);
   const fillableFiat = Math.floor(Number(price) * cleanQty);
-  const clampedMax = Number.isFinite(rawMax) && rawMax > 0
-    ? Math.min(rawMax, fillableFiat > 0 ? fillableFiat : rawMax)
-    : fillableFiat;
+  const clampedMax =
+    Number.isFinite(rawMax) && rawMax > 0
+      ? Math.min(rawMax, fillableFiat > 0 ? fillableFiat : rawMax)
+      : fillableFiat;
   const safeMax = Math.max(Number.isFinite(rawMin) && rawMin > 0 ? rawMin : 50000, clampedMax);
 
   const params = {
@@ -192,12 +211,12 @@ async function updateBuyAd(adId, info, price, quantity, paymentIds) {
     remark: info.remark || '',
     tradingPreferenceSet: normalizePrefs(info.tradingPreferenceSet),
     paymentIds,
-    actionType: 'MODIFY',
+    actionType,
     paymentPeriod: String(info.paymentPeriod || '15'),
   };
 
   if (config.dryRun) {
-    console.log(`[autoBuy] DRY_RUN — would update buy ad ${adId}:`, JSON.stringify(params));
+    console.log(`[autoBuy] DRY_RUN — would send ${actionType}:`, JSON.stringify(params));
     return { ok: true, action: 'dry_run', price, quantity: cleanQty };
   }
 
@@ -210,7 +229,7 @@ async function updateBuyAd(adId, info, price, quantity, paymentIds) {
   return { ok: true, action: 'updated', price, quantity: cleanQty };
 }
 
-// ── Main 5-minute cycle ───────────────────────────────────
+// ── Main cycle ────────────────────────────────────────────
 async function runAutoBuyCycle() {
   if (running) return { ok: true, skipped: 'already_running' };
   const buyAdId = cleanAdId(config.ads.buyAd1Id);
@@ -227,15 +246,22 @@ async function runAutoBuyCycle() {
     step = `fetchBuyAdInfo(${buyAdId})`;
     const info = await fetchBuyAdInfo(buyAdId);
     const status = Number(info.status);
-    const online = info.isOnline === true || status === 10;
+    const online = status === 10; // 10 = online, 20 = offline, 30 = completed
+    const trigger = config.autoBuy.triggerBelowUsdc;
 
-    // If the buy ad is currently offline/pending AND spendable >= 200 USDC, do nothing.
-    if (!online && spendable >= config.autoBuy.triggerBelowUsdc) {
-      console.log(
-        `[autoBuy] spendable (${spendable}) >= ${config.autoBuy.triggerBelowUsdc} USDC and buy ad is offline — idle`
+    console.log(
+      `[autoBuy] spendable ${fmt(spendable)} USDC | buy ad ${STATUS_LABEL[status] || `status ${status}`} ` +
+        `(price ${fmt(info.price)}, left ${fmt(info.lastQuantity ?? info.quantity)} USDC) | trigger < ${trigger}`
+    );
+
+    // Offline and enough USDC → nothing to do.
+    if (!online && spendable >= trigger) {
+      logQuiet(
+        `[autoBuy] idle: spendable ${fmt(spendable)} is not below ${trigger} and the buy ad is offline`
       );
       return { ok: true, action: 'idle', spendable };
     }
+    lastQuietMsg = null;
 
     step = 'fetchLiveBuyAds';
     const marketBuyAds = await fetchLiveBuyAds(20);
@@ -243,65 +269,86 @@ async function runAutoBuyCycle() {
     const genuine = others.filter(isGenuineBuyer);
     const matched = genuine.filter(matchesBuyMarketFilters);
 
-    console.log(
-      `[autoBuy] buy ads: total=${marketBuyAds.length}, genuine=${genuine.length}, ` +
-      `matched(>=${config.autoBuy.minCompetitorQtyUsdc} USDC & ₦${config.autoBuy.filterFiatNgn})=${matched.length}`
-    );
-
     step = 'computeBuyTarget';
     const decision = computeBuyTarget(matched);
     if (!decision.targetPrice) {
-      console.log('[autoBuy] no matching buy competitor found — skipping');
+      console.log(
+        `[autoBuy] market: ${marketBuyAds.length} ads, ${genuine.length} genuine, 0 usable (need ≥ ${config.autoBuy.minCompetitorQtyUsdc} USDC and range covering ₦${config.autoBuy.filterFiatNgn}) — skipping`
+      );
       return { ok: true, action: 'skipped', reason: decision.reason };
     }
 
     console.log(
-      `[autoBuy] top10 avg=${decision.avgTop10}, #1=${decision.firstPrice}, #2=${decision.secondPrice ?? 'N/A'} ` +
-      `-> targeting #${decision.rankTarget} at ${decision.targetPrice} (${decision.reason})`
+      `[autoBuy] market: ${marketBuyAds.length} ads, ${genuine.length} genuine, ${matched.length} usable | ` +
+        `top: ${decision.topPrices.join(', ')} | top-10 avg ${decision.avgTop10}`
+    );
+    console.log(
+      `[autoBuy] target ₦${decision.targetPrice}: ${decision.reason} (+${config.autoBuy.outbidStepNgn})`
     );
 
     step = 'extractPaymentIds';
     const paymentIds = extractPaymentIds(buyAdId, info);
 
-    // Case 1: Ad is currently offline/pending and spendable < 200 -> post/activate with (620 - spendable)
+    // Case 1: ad offline and spendable below trigger → edit and post it ACTIVE
     if (!online) {
       const buyQty = floor2(Math.max(0, config.autoBuy.targetTotalUsdc - spendable));
-      const minFillUsdc = Number(info.minAmount || config.autoBuy.minAmountNgn) / decision.targetPrice;
+      const minFillUsdc =
+        Number(info.minAmount || config.autoBuy.minAmountNgn) / decision.targetPrice;
 
       if (buyQty <= 0 || buyQty < minFillUsdc) {
         console.log(
-          `[autoBuy] calculated buyQty (${buyQty} USDC) is below minimum order (${minFillUsdc.toFixed(2)} USDC) — skipping`
+          `[autoBuy] not posting: quantity ${fmt(buyQty)} USDC is below the minimum order (${fmt(minFillUsdc)} USDC)`
         );
         return { ok: true, action: 'skipped', reason: 'qty_below_min_limit' };
       }
 
-      step = 'updateBuyAd(activate)';
-      const res = await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds);
       console.log(
-        `[autoBuy] posted buy ad ${buyAdId}: qty=${buyQty} USDC (${config.autoBuy.targetTotalUsdc} - ${spendable}) @ ₦${decision.targetPrice}`
+        `[autoBuy] posting buy ad: ${config.autoBuy.targetTotalUsdc} target - ${fmt(spendable)} spendable = ${fmt(buyQty)} USDC @ ₦${decision.targetPrice}`
+      );
+
+      step = 'updateBuyAd(activate)';
+      let res;
+      try {
+        res = await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, 'ACTIVE');
+      } catch (err) {
+        console.log(`[autoBuy] ACTIVE failed (${err.message}) — trying MODIFY, then ACTIVE`);
+        await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, 'MODIFY');
+        res = await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, 'ACTIVE');
+      }
+
+      step = 'confirm(activate)';
+      const after = await fetchBuyAdInfo(buyAdId);
+      const afterStatus = Number(after.status);
+      console.log(
+        `[autoBuy] after posting: ${STATUS_LABEL[afterStatus] || `status ${afterStatus}`} | ` +
+          `price ${fmt(after.price)} | qty ${fmt(after.quantity)} USDC` +
+          (afterStatus === 10 ? ' — LIVE' : ' — NOT LIVE, check the ad on Bybit')
       );
       return res;
     }
 
-    // Case 2: Ad is already online/active -> only adjust price; leave remaining quantity untouched
-    // so partial fills wind down naturally until Bybit takes the ad down to pending.
+    // Case 2: ad already online → only adjust price, leave remaining quantity alone
     const currentPrice = Number(info.price) || 0;
     const total = Number(info.quantity);
-    const hasLast = info.lastQuantity !== undefined && info.lastQuantity !== null && info.lastQuantity !== '';
+    const hasLast =
+      info.lastQuantity !== undefined && info.lastQuantity !== null && info.lastQuantity !== '';
     const remainingQty = hasLast ? Number(info.lastQuantity) : total;
 
     if (Math.abs(currentPrice - decision.targetPrice) <= 0.001) {
-      console.log(`[autoBuy] buy ad ${buyAdId} already at ₦${currentPrice} (rem qty ${remainingQty}) — no price edit needed`);
+      logQuiet(
+        `[autoBuy] buy ad already at ₦${currentPrice} (${fmt(remainingQty)} USDC left) — no price change needed`
+      );
       return { ok: true, action: 'skipped', reason: 'no_price_change_needed' };
     }
+    lastQuietMsg = null;
 
-    // Bybit rejects any edit when remaining value is below the ad's minimum order
-    // (error 912120023). The ad is about to wind down, so don't touch it.
+    // Bybit rejects any edit when remaining value is below the minimum order
+    // (error 912120023). The ad is about to wind down, so leave it.
     const minOrderNgn = Number(info.minAmount) || config.autoBuy.minAmountNgn;
     const remainingValueNgn = remainingQty * decision.targetPrice;
     if (remainingValueNgn < minOrderNgn) {
       console.log(
-        `[autoBuy] remaining ${remainingQty} USDC (~₦${Math.floor(remainingValueNgn)}) is below min order ₦${minOrderNgn} — leaving ad as is`
+        `[autoBuy] leaving ad as is: ${fmt(remainingQty)} USDC left (~₦${Math.floor(remainingValueNgn)}) is below the minimum order ₦${minOrderNgn}`
       );
       return { ok: true, action: 'skipped', reason: 'remaining_below_min_order' };
     }
@@ -309,7 +356,7 @@ async function runAutoBuyCycle() {
     step = 'updateBuyAd(price)';
     const res = await updateBuyAd(buyAdId, info, decision.targetPrice, remainingQty, paymentIds);
     console.log(
-      `[autoBuy] adjusted buy ad ${buyAdId} price: ₦${currentPrice} -> ₦${decision.targetPrice} (rem qty ${remainingQty})`
+      `[autoBuy] price changed ₦${currentPrice} → ₦${decision.targetPrice} (${fmt(remainingQty)} USDC left)`
     );
     return res;
   } catch (err) {
@@ -324,7 +371,7 @@ function startAutoBuyScheduler() {
   if (timer) return;
   const intervalMs = config.autoBuy.pollSeconds * 1000;
   console.log(
-    `[autoBuy] scheduler started (every ${config.autoBuy.pollSeconds}s, trigger < ${config.autoBuy.triggerBelowUsdc} USDC, target = ${config.autoBuy.targetTotalUsdc} - available)`
+    `[autoBuy] scheduler started (every ${config.autoBuy.pollSeconds}s, trigger < ${config.autoBuy.triggerBelowUsdc} USDC, target ${config.autoBuy.targetTotalUsdc} USDC)`
   );
 
   setTimeout(() => {

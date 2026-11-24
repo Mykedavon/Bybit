@@ -138,12 +138,9 @@ async function runCycle() {
     recordFailure('Ad 2 edit', ad2Exec.reason || ad2Exec.error || 'unknown');
   }
 
-  console.log('[cycle] done', {
-    ad1: ad1Exec.action || ad1Exec.reason,
-    ad2: ad2Exec.action || ad2Exec.reason,
-    spendable,
-    failures: consecutiveFailures,
-  });
+  console.log(
+    `[cycle] ad 1: ${ad1Exec.action || ad1Exec.reason} | ad 2: ${ad2Exec.action || ad2Exec.reason} | spendable ${Number(spendable).toFixed(2)} | failures ${consecutiveFailures}`
+  );
 
   if (ad1Exec.ok && ad2Exec.ok) {
     resetFailures();
