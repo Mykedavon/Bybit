@@ -1,7 +1,9 @@
 // src/managers/autoBuyManager.js
 // Monitors spendable USDC and manages BUY_AD_1_ID:
-// - "Owned" USDC = spendable + USDC on hold in pending sell orders.
-//   Wanted buy quantity = AUTO_BUY_TARGET_USDC - owned (recalculated every cycle).
+// - "Owned" USDC = spendable + USDC on hold in pending sell orders + USDC still
+//   coming in from pending buy orders (Bybit already took those off the ad's
+//   remaining quantity). Wanted buy quantity = AUTO_BUY_TARGET_USDC - owned.
+//   The ad is only edited when owned + remaining quantity drifts from the target.
 // - When owned < AUTO_BUY_TRIGGER_USDC and the buy ad is offline, or online but
 //   stuck below the minimum order, it edits the ad (price from the buy market,
 //   wanted quantity) and makes sure it is online (MODIFY for a stuck online ad,
@@ -16,7 +18,7 @@
 const { client } = require('../bybit/client');
 const { fetchLiveBuyAds } = require('../bybit/market');
 const { scheduleP2P } = require('../bybit/p2pRaw');
-const { getUsdcBalances } = require('./inventory');
+const { getUsdcBalances, getPendingBuyIncomingUsdc } = require('./inventory');
 const config = require('../config');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -26,7 +28,7 @@ const fmt = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(2) : 'n/a');
 const STATUS_LABEL = { 10: 'online', 20: 'offline', 30: 'completed' };
 
 // Quantity changes smaller than this (USDC) are not worth an edit
-const QTY_TOLERANCE = 0.5;
+const QTY_TOLERANCE = 1;
 
 const paymentCache = new Map(); // adId -> { ids, at }
 const PAYMENT_CACHE_MS = 10 * 60 * 1000;
@@ -246,7 +248,20 @@ async function runAutoBuyCycle() {
   try {
     step = 'getUsdcBalances';
     const { spendable, onHold } = await getUsdcBalances();
-    const owned = spendable + onHold; // USDC you hold, including pending sell orders
+
+    // USDC still coming in from pending buy orders: Bybit has already deducted it
+    // from the ad's remaining quantity, so it must count as owned or the bot would
+    // add it back and then remove it again when the order completes.
+    let incoming = 0;
+    let incomingKnown = true;
+    try {
+      incoming = await getPendingBuyIncomingUsdc();
+    } catch (err) {
+      incomingKnown = false;
+      console.log(`[autoBuy] could not read pending buy orders (${err.message}) — not changing the quantity this cycle`);
+    }
+
+    const owned = spendable + onHold + incoming;
     const desiredQty = floor2(Math.max(0, config.autoBuy.targetTotalUsdc - owned));
 
     step = `fetchBuyAdInfo(${buyAdId})`;
@@ -263,7 +278,7 @@ async function runAutoBuyCycle() {
     const needsPost = !online || stuck;
 
     console.log(
-      `[autoBuy] USDC: spendable ${fmt(spendable)} + on hold ${fmt(onHold)} = ${fmt(owned)} | ` +
+      `[autoBuy] USDC: spendable ${fmt(spendable)} + sell hold ${fmt(onHold)} + buy incoming ${fmt(incoming)} = ${fmt(owned)} | ` +
         `wanted buy qty ${config.autoBuy.targetTotalUsdc} - ${fmt(owned)} = ${fmt(desiredQty)} | trigger < ${trigger}`
     );
     console.log(
@@ -311,7 +326,7 @@ async function runAutoBuyCycle() {
     step = 'extractPaymentIds';
     const paymentIds = extractPaymentIds(buyAdId, info);
 
-    // Case 1: ad offline (or stuck below the minimum order) and spendable below
+    // Case 1: ad offline (or stuck below the minimum order) and owned USDC below
     // trigger → edit it and make sure it is online
     if (needsPost) {
       const buyQty = desiredQty;
@@ -377,7 +392,7 @@ async function runAutoBuyCycle() {
     // Resize to the wanted quantity unless it would fall below the minimum order
     // (then the target is nearly reached and the ad is left to wind down).
     const canResize = desiredQty * decision.targetPrice >= minOrderNgn;
-    const qtySame = Math.abs(remainingQty - desiredQty) < QTY_TOLERANCE;
+    const qtySame = !incomingKnown || Math.abs(remainingQty - desiredQty) < QTY_TOLERANCE;
     const newQty = canResize && !qtySame ? desiredQty : remainingQty;
     const qtyChanged = newQty !== remainingQty;
 
@@ -410,7 +425,7 @@ async function runAutoBuyCycle() {
     if (!priceSame) changes.push(`price ₦${currentPrice} → ₦${decision.targetPrice}`);
     if (qtyChanged) {
       changes.push(
-        `qty ${fmt(remainingQty)} → ${fmt(newQty)} USDC (${config.autoBuy.targetTotalUsdc} - ${fmt(owned)} owned)`
+        `qty ${fmt(remainingQty)} → ${fmt(newQty)} USDC (${config.autoBuy.targetTotalUsdc} target - ${fmt(owned)} owned; remaining + owned was ${fmt(remainingQty + owned)})`
       );
     }
     console.log(`[autoBuy] buy ad updated: ${changes.join(', ')}`);
