@@ -295,6 +295,17 @@ async function runAutoBuyCycle() {
       return { ok: true, action: 'skipped', reason: 'no_price_change_needed' };
     }
 
+    // Bybit rejects any edit when remaining value is below the ad's minimum order
+    // (error 912120023). The ad is about to wind down, so don't touch it.
+    const minOrderNgn = Number(info.minAmount) || config.autoBuy.minAmountNgn;
+    const remainingValueNgn = remainingQty * decision.targetPrice;
+    if (remainingValueNgn < minOrderNgn) {
+      console.log(
+        `[autoBuy] remaining ${remainingQty} USDC (~₦${Math.floor(remainingValueNgn)}) is below min order ₦${minOrderNgn} — leaving ad as is`
+      );
+      return { ok: true, action: 'skipped', reason: 'remaining_below_min_order' };
+    }
+
     step = 'updateBuyAd(price)';
     const res = await updateBuyAd(buyAdId, info, decision.targetPrice, remainingQty, paymentIds);
     console.log(
