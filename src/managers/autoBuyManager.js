@@ -9,6 +9,7 @@
 // - While the ad is online, every cycle it re-syncs BOTH the price and the quantity
 //   (so a cancelled or new sell order is reflected). Bybit takes the ad offline by
 //   itself when the remaining value drops below the minimum order.
+// - The bot never changes your order limits (min/max): it sends them back as they are.
 // - Competitors: reliable traders with enough USDC whose limits cover
 //   AUTO_BUY_FILTER_FIAT_NGN. Bids #1 + step when the top 3 are tight, else #2 + step.
 
@@ -195,16 +196,13 @@ function normalizePrefs(prefs) {
 }
 
 // actionType: 'MODIFY' edits the ad, 'ACTIVE' relists (re-onlines) it
+// Order limits (minAmount / maxAmount) are sent back exactly as they are on Bybit,
+// so the bot only ever changes the price and the quantity.
 async function updateBuyAd(adId, info, price, quantity, paymentIds, actionType = 'MODIFY') {
   const cleanQty = floor2(quantity);
-  const rawMin = Number(info.minAmount || config.autoBuy.minAmountNgn);
-  const rawMax = Number(info.maxAmount || config.autoBuy.maxAmountNgn);
-  const fillableFiat = Math.floor(Number(price) * cleanQty);
-  const clampedMax =
-    Number.isFinite(rawMax) && rawMax > 0
-      ? Math.min(rawMax, fillableFiat > 0 ? fillableFiat : rawMax)
-      : fillableFiat;
-  const safeMax = Math.max(Number.isFinite(rawMin) && rawMin > 0 ? rawMin : 50000, clampedMax);
+  const hasLimit = (v) => v !== undefined && v !== null && v !== '' && Number(v) > 0;
+  const minAmount = hasLimit(info.minAmount) ? String(info.minAmount) : String(config.autoBuy.minAmountNgn);
+  const maxAmount = hasLimit(info.maxAmount) ? String(info.maxAmount) : String(config.autoBuy.maxAmountNgn);
 
   const params = {
     id: String(adId),
@@ -212,8 +210,8 @@ async function updateBuyAd(adId, info, price, quantity, paymentIds, actionType =
     premium: '',
     price: String(price),
     quantity: String(cleanQty),
-    minAmount: String(Number.isFinite(rawMin) && rawMin > 0 ? rawMin : config.autoBuy.minAmountNgn),
-    maxAmount: String(safeMax),
+    minAmount,
+    maxAmount,
     remark: info.remark || '',
     tradingPreferenceSet: normalizePrefs(info.tradingPreferenceSet),
     paymentIds,
