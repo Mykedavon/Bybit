@@ -1,8 +1,9 @@
 // src/managers/autoBuyManager.js
 // Monitors spendable USDC and manages BUY_AD_1_ID:
-// - When spendable < AUTO_BUY_TRIGGER_USDC and the buy ad is offline, it edits the ad
-//   (price from the buy market, quantity = AUTO_BUY_TARGET_USDC - spendable) and
-//   relists it as ACTIVE, even if Bybit had taken it offline.
+// - When spendable < AUTO_BUY_TRIGGER_USDC and the buy ad is offline, or online but
+//   stuck below the minimum order, it edits the ad (price from the buy market,
+//   quantity = AUTO_BUY_TARGET_USDC - spendable) and makes sure it is online
+//   (MODIFY for a stuck online ad, ACTIVE relist for an offline one).
 // - While the ad is online it only adjusts the price every AUTO_BUY_POLL_SECONDS.
 //   Bybit takes the ad offline by itself when the remaining value drops below the
 //   minimum order.
@@ -249,15 +250,23 @@ async function runAutoBuyCycle() {
     const online = status === 10; // 10 = online, 20 = offline, 30 = completed
     const trigger = config.autoBuy.triggerBelowUsdc;
 
+    // An "online" ad whose remaining value is below the minimum order is dead:
+    // treat it like an offline ad so it gets reposted when the trigger hits.
+    const remainingNow = Number(info.lastQuantity ?? info.quantity) || 0;
+    const minOrderNow = Number(info.minAmount) || config.autoBuy.minAmountNgn;
+    const stuck = online && remainingNow * (Number(info.price) || 0) < minOrderNow;
+    const needsPost = !online || stuck;
+
     console.log(
-      `[autoBuy] spendable ${fmt(spendable)} USDC | buy ad ${STATUS_LABEL[status] || `status ${status}`} ` +
+      `[autoBuy] spendable ${fmt(spendable)} USDC | buy ad ${STATUS_LABEL[status] || `status ${status}`}` +
+        `${stuck ? ' [below minimum order]' : ''} ` +
         `(price ${fmt(info.price)}, left ${fmt(info.lastQuantity ?? info.quantity)} USDC) | trigger < ${trigger}`
     );
 
-    // Offline and enough USDC → nothing to do.
-    if (!online && spendable >= trigger) {
+    // Needs posting but enough USDC → nothing to do.
+    if (needsPost && spendable >= trigger) {
       logQuiet(
-        `[autoBuy] idle: spendable ${fmt(spendable)} is not below ${trigger} and the buy ad is offline`
+        `[autoBuy] idle: spendable ${fmt(spendable)} is not below ${trigger} and the buy ad is ${stuck ? 'below the minimum order' : 'offline'}`
       );
       return { ok: true, action: 'idle', spendable };
     }
@@ -289,8 +298,9 @@ async function runAutoBuyCycle() {
     step = 'extractPaymentIds';
     const paymentIds = extractPaymentIds(buyAdId, info);
 
-    // Case 1: ad offline and spendable below trigger → edit and post it ACTIVE
-    if (!online) {
+    // Case 1: ad offline (or stuck below the minimum order) and spendable below
+    // trigger → edit it and make sure it is online
+    if (needsPost) {
       const buyQty = floor2(Math.max(0, config.autoBuy.targetTotalUsdc - spendable));
       const minFillUsdc =
         Number(info.minAmount || config.autoBuy.minAmountNgn) / decision.targetPrice;
@@ -306,18 +316,32 @@ async function runAutoBuyCycle() {
         `[autoBuy] posting buy ad: ${config.autoBuy.targetTotalUsdc} target - ${fmt(spendable)} spendable = ${fmt(buyQty)} USDC @ ₦${decision.targetPrice}`
       );
 
-      step = 'updateBuyAd(activate)';
+      step = 'updateBuyAd(post)';
+      // Online but stuck below the minimum order → edit quantity/price (MODIFY).
+      // Offline → relist (ACTIVE). If the first one fails, try the other.
+      const firstAction = online ? 'MODIFY' : 'ACTIVE';
+      const otherAction = online ? 'ACTIVE' : 'MODIFY';
+      let lastAction = firstAction;
+      console.log(
+        `[autoBuy] sending ${firstAction} (${online ? 'ad is online but below the minimum order' : 'ad is offline'})`
+      );
+
       let res;
       try {
-        res = await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, 'ACTIVE');
+        res = await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, firstAction);
       } catch (err) {
-        console.log(`[autoBuy] ACTIVE failed (${err.message}) — trying MODIFY, then ACTIVE`);
-        await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, 'MODIFY');
-        res = await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, 'ACTIVE');
+        console.log(`[autoBuy] ${firstAction} failed (${err.message}) — trying ${otherAction}`);
+        lastAction = otherAction;
+        res = await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, otherAction);
       }
 
-      step = 'confirm(activate)';
-      const after = await fetchBuyAdInfo(buyAdId);
+      step = 'confirm(post)';
+      let after = await fetchBuyAdInfo(buyAdId);
+      if (Number(after.status) !== 10 && lastAction === 'MODIFY') {
+        console.log('[autoBuy] ad is still not online after the edit — relisting with ACTIVE');
+        await updateBuyAd(buyAdId, info, decision.targetPrice, buyQty, paymentIds, 'ACTIVE');
+        after = await fetchBuyAdInfo(buyAdId);
+      }
       const afterStatus = Number(after.status);
       console.log(
         `[autoBuy] after posting: ${STATUS_LABEL[afterStatus] || `status ${afterStatus}`} | ` +
