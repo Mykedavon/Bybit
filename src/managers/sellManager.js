@@ -1,5 +1,4 @@
-
- // src/managers/sellManager.js
+// src/managers/sellManager.js
 // The sell-side decision maker.
 // Fetches live market ads, filters genuine competitors, and returns
 // ranked targets for Ad 1 (general market) and Ad 2 (bulk market).
@@ -75,10 +74,41 @@ function computeTarget(competitorPool) {
   };
 }
 
+// ── Optional: print the market list (set LOG_MARKET_ADS=true) ──
+// Prints only when the list changes, so the console is not flooded.
+let lastMarketSig = null;
+
+function logMarketAds(marketAds) {
+  const on = String(process.env.LOG_MARKET_ADS || '').toLowerCase() === 'true';
+  if (!on) return;
+
+  const myIds = [config.ads.sellAd1Id, config.ads.sellAd2Id].map(String);
+  const rows = [...marketAds]
+    .filter((ad) => Number.isFinite(Number(ad.price)))
+    .sort((a, b) => Number(a.price) - Number(b.price))
+    .slice(0, 10);
+
+  const sig = rows.map((ad) => `${ad.id}:${ad.price}:${Math.round(Number(ad.quantity) || 0)}`).join('|');
+  if (sig === lastMarketSig) return;
+  lastMarketSig = sig;
+
+  console.log('[market list] latest 10 sell ads (cheapest first):');
+  rows.forEach((ad, i) => {
+    const mine = myIds.includes(String(ad.id));
+    const rate = Number(ad.completionRate);
+    const ok =
+      (Number(ad.completionRate) || 0) >= config.competitor.minCompletionRate &&
+      (Number(ad.recentOrders) || 0) >= config.competitor.minOrders30d;
+    console.log(
+      `  ${String(i + 1).padStart(2)}. ₦${Number(ad.price).toFixed(2)} | ${String(Math.round(Number(ad.quantity) || 0)).padStart(5)} USDC | ` +
+        `${mine ? 'YOUR AD' : (ad.nickName || 'unknown')}` +
+        (mine ? '' : ` | ${Number.isFinite(rate) ? rate : '?'}% done, ${ad.recentOrders ?? '?'} orders${ok ? '' : ' (filtered out)'}`)
+    );
+  });
+}
+
 // ── Main cycle: fetch, filter, prepare candidates ────────
 async function runSellCycle() {
-  console.log('[sell] cycle started');
-
   let marketAds;
   try {
     marketAds = await fetchLiveSellAds();
@@ -94,13 +124,23 @@ async function runSellCycle() {
     return { ok: false, reason: 'no_ads_returned' };
   }
 
+  logMarketAds(marketAds);
+
+  // Are our own ads in Bybit's market list? (Bybit hides ads priced too far below
+  // the rest of the market; a hidden ad is missing from this list.)
+  const listedIds = new Set(marketAds.map((ad) => String(ad.id)));
+  const listedPrices = marketAds.map((ad) => Number(ad.price)).filter((n) => Number.isFinite(n));
+  const visibility = {
+    ad1: listedIds.has(String(config.ads.sellAd1Id)),
+    ad2: listedIds.has(String(config.ads.sellAd2Id)),
+    listedMax: listedPrices.length ? Math.max(...listedPrices) : 0,
+  };
+
   // Exclude own ads
   const competitors = excludeOwnAds(marketAds);
-  console.log(`[sell] ${competitors.length} competitors after excluding own ads`);
 
   // Filter genuine competitors
   const genuine = competitors.filter(isGenuine);
-  console.log(`[sell] ${genuine.length} genuine competitors after filter`);
 
   if (genuine.length === 0) {
     return { ok: false, reason: 'no_genuine_competitor' };
@@ -115,13 +155,15 @@ async function runSellCycle() {
   );
 
   console.log(
-    `[sell] ${bulkPool.length} bulk competitors (>= ${config.pricing.bulkMinQuantity} USDC)`
+    `[sell] ${competitors.length} competitors → ${genuine.length} genuine → ${bulkPool.length} bulk (≥ ${config.pricing.bulkMinQuantity} USDC) | ` +
+      `your ads in market list: ad 1 ${visibility.ad1 ? 'yes' : 'NO'}, ad 2 ${visibility.ad2 ? 'yes' : 'NO'}`
   );
 
   const ad2Target = computeTarget(bulkPool);
 
   return {
     ok: true,
+    visibility,
 
     ad1: {
       adId: config.ads.sellAd1Id,

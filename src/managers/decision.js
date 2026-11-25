@@ -5,6 +5,7 @@
 // If a competitor's undercut target is below safety, that competitor is skipped
 // and the next one is used. Ad 2 also stays above ad 1 by a gap.
 // Ad 1 forfeits tiny, far-cheaper competitors (likely hidden by Bybit).
+// A hidden-ad guard stops pricing below the price at which Bybit hid an ad.
 
 const { client } = require('../bybit/client');
 const { scheduleP2P } = require('../bybit/p2pRaw');
@@ -69,6 +70,7 @@ async function getAdState(adId) {
 
   return {
     id: adId,
+    status: Number(data.status),
     price: Number(data.price) || 0,
     quantity: Number.isFinite(total) ? total : 0,
     lastQuantity: Number.isFinite(remaining) ? remaining : 0,
@@ -241,10 +243,64 @@ function dropOutliers(candidates, lines) {
   return list;
 }
 
+// ── Hidden-ad guard ───────────────────────────────────────
+// Bybit hides ads that are priced too far below the rest of the market. A hidden ad
+// is missing from the market list even though it is online and has stock. When that
+// happens we remember a minimum price (the hidden price + HIDDEN_STEP_NGN) and never
+// price below it again until the ad has been visible for HIDDEN_HOLD_MINUTES. If it
+// is still hidden at the new price, the minimum climbs again by the same step.
+// This works whatever Bybit's exact rule is, because it reacts to what Bybit does.
+const hiddenState = { ad1: null, ad2: null }; // { minPrice, visibleSince }
+
+function updateHiddenGuard(tag, adState, visibility, lines) {
+  const guard = hiddenState[tag];
+  if (!visibility) return guard ? guard.minPrice : null;
+
+  const now = Date.now();
+  const holdMs = envNum('HIDDEN_HOLD_MINUTES', 120) * 60 * 1000;
+  const step = envNum('HIDDEN_STEP_NGN', 1);
+  const listed = visibility[tag];
+
+  // Should this ad be in the list? Online, has stock, and priced inside the range
+  // the list covers (an ad above the 10th cheapest is simply not shown).
+  const shouldBeListed =
+    adState.status === 10 &&
+    adState.lastQuantity > 0 &&
+    adState.price > 0 &&
+    adState.price <= visibility.listedMax;
+
+  if (shouldBeListed && !listed) {
+    const base = Math.max(guard ? guard.minPrice : 0, adState.price);
+    const minPrice = Number((base + step).toFixed(2));
+    hiddenState[tag] = { minPrice, visibleSince: null };
+    lines.push(
+      `HIDDEN: not in Bybit's market list at ₦${fmt(adState.price)} (list goes up to ₦${fmt(visibility.listedMax)}) → will not price below ₦${fmt(minPrice)}`
+    );
+    return minPrice;
+  }
+
+  if (guard) {
+    if (listed) {
+      if (!guard.visibleSince) guard.visibleSince = now;
+      if (now - guard.visibleSince >= holdMs) {
+        hiddenState[tag] = null;
+        console.log(`[${tag}] visible for ${envNum('HIDDEN_HOLD_MINUTES', 120)} min — hidden-ad guard cleared`);
+        return null;
+      }
+    } else {
+      guard.visibleSince = null;
+    }
+    lines.push(`hidden-ad guard on: not pricing below ₦${fmt(guard.minPrice)}`);
+    return guard.minPrice;
+  }
+
+  return null;
+}
+
 // ── Select the first competitor whose undercut is safe ────
 // Candidates arrive sorted cheapest-to-most-expensive.
 // Safety floor is a restriction, not a price target.
-// minPrice (ad 2 only) is ad 1's price plus the gap.
+// minPrice (ad 2 gap and/or hidden-ad guard) is a second lower limit.
 // Every skipped competitor and the final choice are written to `lines`.
 function selectSafeTarget(
   originalTarget,
@@ -302,7 +358,7 @@ function selectSafeTarget(
     const why =
       Number(c.targetPrice) < floorVal
         ? `below safety floor ${fmt(floorVal)}`
-        : `too close to ad 1 (needs ≥ ${fmt(minVal)})`;
+        : `below the minimum ₦${fmt(minVal)} (ad 1 gap or hidden-ad guard)`;
     lines.push(`skip ${c.competitor.price}: undercut ${fmt(c.targetPrice)} is ${why}`);
   }
 
@@ -473,15 +529,31 @@ async function evaluateBothAds(sellCycleResult, spendable) {
   const ad1Lines = [];
   const ad2Lines = [];
 
+  // Did Bybit hide either ad? If so, never price below the hidden price again.
+  const visibility = sellCycleResult.visibility || null;
+  const ad1HiddenMin = updateHiddenGuard('ad1', ad1State, visibility, ad1Lines);
+  const ad2HiddenMin = updateHiddenGuard('ad2', ad2State, visibility, ad2Lines);
+
   // Ad 1: first safely undercuttable competitor (tiny far-cheaper ads forfeited).
-  const ad1Target = selectSafeTarget(sellCycleResult.ad1, ad1Floor, 'Ad 1', null, true, ad1Lines);
+  const ad1Target = selectSafeTarget(
+    sellCycleResult.ad1,
+    ad1Floor,
+    'Ad 1',
+    ad1HiddenMin,
+    true,
+    ad1Lines
+  );
 
   // Ad 2 must stay above ad 1 by the required gap, so it picks the next
   // competitor it can undercut above that level instead of being pushed up.
-  const ad2MinPrice =
+  const ad2GapMin =
     ad1Target && ad1Target.targetPrice !== null && ad1Target.targetPrice !== undefined
       ? Number((ad1Target.targetPrice + separationNgn()).toFixed(2))
       : null;
+  const ad2MinPrice =
+    ad2GapMin === null && ad2HiddenMin === null
+      ? null
+      : Math.max(ad2GapMin || 0, ad2HiddenMin || 0);
   const ad2Target = selectSafeTarget(
     sellCycleResult.ad2,
     ad2Floor,
