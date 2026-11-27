@@ -107,7 +107,7 @@ function logMarketAds(marketAds) {
     .slice(0, 10);
 
   const sig = rows
-    .map((ad) => `${ad.id}:${ad.price}:${Math.round(Number(ad.quantity) || 0)}:${ad.maxAmount}`)
+    .map((ad) => `${ad.id}:${ad.price}:${Math.round(Number(ad.quantity) || 0)}:${ad.maxAmount}:${ad.orderBookLevel}:${ad.discountAd}:${ad.lastPrice}:${ad.isOnline}`)
     .join('|');
   if (sig === lastMarketSig) return;
   lastMarketSig = sig;
@@ -123,6 +123,7 @@ function logMarketAds(marketAds) {
     console.log(
       `  ${String(i + 1).padStart(2)}. ₦${Number(ad.price).toFixed(2)} | ${String(Math.round(Number(ad.quantity) || 0)).padStart(5)} USDC | ` +
         `max ₦${max ? max.toLocaleString('en-US') : '?'} | ` +
+        `[online ${ad.isOnline}, lvl ${ad.orderBookLevel}, disc ${ad.discountAd}/${ad.discountRate}, last ${ad.lastPrice}, rec ${ad.recommend}, blk ${ad.blocked}/${ad.ban}/${ad.baned}] | ` +
         `${mine ? 'YOUR AD' : (ad.nickName || 'unknown')}` +
         (mine ? '' : ` | ${Number.isFinite(rate) ? rate : '?'}% done, ${ad.recentOrders ?? '?'} orders${ok ? '' : ' (filtered out)'}`)
     );
