@@ -19,6 +19,24 @@ function isGenuine(ad) {
     orders >= config.competitor.minOrders30d;
 }
 
+// ── Bulk competitor: enough USDC AND a big enough max order limit ──
+// An ad with 150+ USDC but a max order of only ₦100,000 is not a real bulk seller.
+// BULK_MIN_MAX_ORDER_NGN (env, default 500000) is the smallest max order limit
+// (in naira) an ad must allow to count as a bulk competitor. Set 0 to turn it off.
+// If Bybit does not report a max limit for an ad, the ad is kept.
+function bulkMinMaxOrder() {
+  const v = Number(process.env.BULK_MIN_MAX_ORDER_NGN);
+  return Number.isFinite(v) && v >= 0 ? v : 500000;
+}
+
+function maxOrderOk(ad) {
+  const need = bulkMinMaxOrder();
+  if (!need) return true;
+  const max = Number(ad.maxAmount);
+  if (!Number.isFinite(max) || max <= 0) return true;
+  return max >= need;
+}
+
 // ── Exclude your own ads from the competitor list ─────────
 function excludeOwnAds(ads) {
   const myIds = [config.ads.sellAd1Id, config.ads.sellAd2Id]
@@ -88,7 +106,9 @@ function logMarketAds(marketAds) {
     .sort((a, b) => Number(a.price) - Number(b.price))
     .slice(0, 10);
 
-  const sig = rows.map((ad) => `${ad.id}:${ad.price}:${Math.round(Number(ad.quantity) || 0)}`).join('|');
+  const sig = rows
+    .map((ad) => `${ad.id}:${ad.price}:${Math.round(Number(ad.quantity) || 0)}:${ad.maxAmount}`)
+    .join('|');
   if (sig === lastMarketSig) return;
   lastMarketSig = sig;
 
@@ -99,8 +119,10 @@ function logMarketAds(marketAds) {
     const ok =
       (Number(ad.completionRate) || 0) >= config.competitor.minCompletionRate &&
       (Number(ad.recentOrders) || 0) >= config.competitor.minOrders30d;
+    const max = Number(ad.maxAmount);
     console.log(
       `  ${String(i + 1).padStart(2)}. ₦${Number(ad.price).toFixed(2)} | ${String(Math.round(Number(ad.quantity) || 0)).padStart(5)} USDC | ` +
+        `max ₦${max ? max.toLocaleString('en-US') : '?'} | ` +
         `${mine ? 'YOUR AD' : (ad.nickName || 'unknown')}` +
         (mine ? '' : ` | ${Number.isFinite(rate) ? rate : '?'}% done, ${ad.recentOrders ?? '?'} orders${ok ? '' : ' (filtered out)'}`)
     );
@@ -149,15 +171,32 @@ async function runSellCycle() {
   // ── Ad 1: general market ──────────────────────────────
   const ad1Target = computeTarget(genuine);
 
-  // ── Ad 2: bulk market ────────────────────────────────
-  const bulkPool = genuine.filter(
+  // ── Ad 2: bulk market (enough USDC and a big enough max order limit) ──
+  const bulkByQty = genuine.filter(
     (ad) => Number(ad.quantity) >= config.pricing.bulkMinQuantity
   );
+  const bulkPool = bulkByQty.filter(maxOrderOk);
+  const droppedByLimit = bulkByQty.filter((ad) => !maxOrderOk(ad));
+  const needMax = bulkMinMaxOrder();
 
   console.log(
-    `[sell] ${competitors.length} competitors → ${genuine.length} genuine → ${bulkPool.length} bulk (≥ ${config.pricing.bulkMinQuantity} USDC) | ` +
+    `[sell] ${competitors.length} competitors → ${genuine.length} genuine → ${bulkPool.length} bulk ` +
+      `(≥ ${config.pricing.bulkMinQuantity} USDC${needMax ? ` and max order ≥ ₦${needMax.toLocaleString('en-US')}` : ''}) | ` +
       `your ads in market list: ad 1 ${visibility.ad1 ? 'yes' : 'NO'}, ad 2 ${visibility.ad2 ? 'yes' : 'NO'}`
   );
+
+  if (droppedByLimit.length > 0) {
+    console.log(
+      `[sell] ad 2 ignores ${droppedByLimit.length} small-limit ad(s): ` +
+        droppedByLimit
+          .slice(0, 5)
+          .map(
+            (ad) =>
+              `${Number(ad.price)} (${Math.round(Number(ad.quantity))} USDC, max ₦${Number(ad.maxAmount).toLocaleString('en-US')})`
+          )
+          .join(', ')
+    );
+  }
 
   const ad2Target = computeTarget(bulkPool);
 
